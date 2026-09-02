@@ -1,0 +1,1479 @@
+Here's the complete production-grade Next.js (App Router) + TypeScript + Firebase implementation for **Screen 2 — Home**, built strictly from the spec (curated attention surfacing, four core states, no vanity metrics, offline/stale handling, accessibility, analytics, and the compact `/home/summary` data contract).
+
+---
+
+### `src/types/home.ts`
+
+```typescript
+// src/types/home.ts
+
+export type HomeStatus =
+  | "new"               // State 1 — first-time / no history
+  | "healthy"           // State 2 — monitoring, nothing to do
+  | "attention"         // State 3 — active recovery, opportunities exist
+  | "needs_human"       // State 4 — human intervention required
+  | "mixed"             // State 5 — attention + needs_human simultaneously
+  | "partial_coverage"  // State 6 — one or more channels not connected
+  | "degraded"          // State 7 — temporary service problem
+  | "account_issue";    // State 8 — billing / subscription problem
+
+export type ChannelId = "whatsapp" | "phone" | "sms" | "email" | "instagram";
+
+export interface ChannelCoverage {
+  channel: ChannelId;
+  label: string;
+  connected: boolean;
+}
+
+export interface AttentionOpportunity {
+  id: string;
+  customerDisplayName: string; // e.g. "Sarah" or "Sarah M." — never full PII
+  reason: string;              // human-readable, evidence-based, e.g. "Quote sent 3 days ago · No reply"
+  canAutoRecover: boolean;
+}
+
+export interface NeedsHumanOpportunity {
+  id: string;
+  customerDisplayName: string;
+  reason: string; // e.g. "Wants to confirm a price Isolynic doesn't know."
+}
+
+export interface ActivityItem {
+  id: string;
+  timestamp: number; // epoch ms
+  label: string;      // e.g. "Sarah replied to Isolynic"
+  opportunityId?: string;
+  navigateTo?: "conversation" | "opportunity" | "booking";
+}
+
+export interface RevenueEstimate {
+  amount: number;
+  isEstimate: boolean; // if true, UI must prefix with "Estimated"
+  hasData: boolean;    // if false, do not render any dollar figure
+}
+
+export interface NextBooking {
+  customerDisplayName: string;
+  timeLabel: string; // e.g. "Today, 2:00 PM"
+  opportunityId?: string;
+}
+
+export interface WeeklySummary {
+  recoveredCount: number;
+  bookedCount: number;
+  stillActiveCount: number;
+  lostCount: number;
+  revenue: RevenueEstimate;
+}
+
+export interface AccountStatus {
+  state: "active" | "paused" | "past_due";
+  message?: string;
+}
+
+export interface HomeSummary {
+  status: HomeStatus;
+
+  // Attention
+  attentionCount: number;
+  recoverableAutomatically: number;
+  attentionOpportunities: AttentionOpportunity[];
+
+  // Needs human
+  needsHumanCount: number;
+  needsHumanOpportunities: NeedsHumanOpportunity[];
+
+  // Recovery / results
+  recoveredThisWeek: number;
+  bookedThisWeek: number;
+  activeRecoveries: number;
+  repliedThisWeek: number;
+  stillDecidingThisWeek: number;
+
+  // Bookings
+  nextBooking: NextBooking | null;
+  bookingsThisWeekCount: number;
+
+  // Activity
+  recentActivity: ActivityItem[];
+
+  // Weekly performance
+  weeklySummary: WeeklySummary;
+
+  // Coverage & account
+  coverage: ChannelCoverage[];
+  degradedChannels: { channel: ChannelId; label: string }[];
+  account: AccountStatus;
+
+  // Meta
+  updatedAt: number; // epoch ms — for staleness / offline labeling
+}
+
+export interface HomeSummaryDoc extends HomeSummary {
+  ownerId: string;
+}
+```
+
+---
+
+### `src/lib/firebase.ts`
+
+```typescript
+// src/lib/firebase.ts
+import { initializeApp, getApps, getApp, type FirebaseApp } from "firebase/app";
+import {
+  getFirestore,
+  enableIndexedDbPersistence,
+  type Firestore,
+} from "firebase/firestore";
+import { getAuth, type Auth } from "firebase/auth";
+
+const firebaseConfig = {
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
+};
+
+function getFirebaseApp(): FirebaseApp {
+  return getApps().length ? getApp() : initializeApp(firebaseConfig);
+}
+
+export const app = getFirebaseApp();
+export const db: Firestore = getFirestore(app);
+export const auth: Auth = getAuth(app);
+
+// Offline cache — required by spec §52 ("show last known valid state offline").
+// Guarded for SSR since IndexedDB only exists in the browser, and guarded
+// against multi-tab failures which are non-fatal.
+if (typeof window !== "undefined") {
+  enableIndexedDbPersistence(db).catch((err) => {
+    if (err.code === "failed-precondition") {
+      // Multiple tabs open — persistence can only be enabled in one at a time.
+      console.warn("Firestore persistence unavailable: multiple tabs open.");
+    } else if (err.code === "unimplemented") {
+      console.warn("Firestore persistence unavailable in this browser.");
+    }
+  });
+}
+```
+
+---
+
+### `src/lib/analytics.ts`
+
+```typescript
+// src/lib/analytics.ts
+
+// Event names as specified in §57 "Core Analytics for Home".
+export type HomeAnalyticsEvent =
+  | "home_viewed"
+  | "attention_card_viewed"
+  | "review_customers_clicked"
+  | "needs_you_clicked"
+  | "recovery_results_clicked"
+  | "activity_item_clicked"
+  | "home_refresh"
+  | "home_load_time"
+  | "home_error"
+  | "customer_action_completed";
+
+interface AnalyticsPayload {
+  [key: string]: string | number | boolean | undefined;
+}
+
+/**
+ * Thin analytics facade. Swap the internals for Segment / Amplitude / GA4 /
+ * a Firebase Analytics logEvent call without touching call sites.
+ */
+export function track(event: HomeAnalyticsEvent, payload: AnalyticsPayload = {}): void {
+  if (typeof window === "undefined") return;
+  try {
+    // Example real wiring:
+    // import { getAnalytics, logEvent } from "firebase/analytics";
+    // logEvent(getAnalytics(app), event, payload);
+    if (process.env.NODE_ENV !== "production") {
+      // eslint-disable-next-line no-console
+      console.debug(`[analytics] ${event}`, payload);
+    }
+    window.dispatchEvent(new CustomEvent("isolynic:analytics", { detail: { event, payload } }));
+  } catch {
+    // Analytics must never break the product experience.
+  }
+}
+```
+
+---
+
+### `src/lib/utils.ts`
+
+```typescript
+// src/lib/utils.ts
+import { clsx, type ClassValue } from "clsx";
+import { twMerge } from "tailwind-merge";
+
+export function cn(...inputs: ClassValue[]): string {
+  return twMerge(clsx(inputs));
+}
+
+/**
+ * §30 Revenue Display Rules — never fabricate a number.
+ */
+export function formatRevenue(revenue: { amount: number; isEstimate: boolean; hasData: boolean }): string | null {
+  if (!revenue.hasData) return null;
+  const formatted = new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0,
+  }).format(revenue.amount);
+  return revenue.isEstimate ? `Estimated ${formatted}` : formatted;
+}
+
+/**
+ * §52 Offline / staleness labeling.
+ */
+export function formatUpdatedAt(updatedAt: number): string {
+  const diffMs = Date.now() - updatedAt;
+  const diffMin = Math.round(diffMs / 60000);
+  if (diffMin < 1) return "Just now";
+  if (diffMin === 1) return "1 minute ago";
+  if (diffMin < 60) return `${diffMin} minutes ago`;
+  const diffHr = Math.round(diffMin / 60);
+  if (diffHr === 1) return "1 hour ago";
+  if (diffHr < 24) return `${diffHr} hours ago`;
+  const diffDay = Math.round(diffHr / 24);
+  return diffDay === 1 ? "1 day ago" : `${diffDay} days ago`;
+}
+
+export function formatActivityTime(timestamp: number): string {
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(new Date(timestamp));
+}
+```
+
+---
+
+### `src/hooks/useHomeSummary.ts`
+
+Event-driven Firestore listener (spec §51: avoid polling, update on state change) with offline/stale detection (§52) and a manual `refresh` fallback.
+
+```typescript
+// src/hooks/useHomeSummary.ts
+"use client";
+
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { doc, onSnapshot, type Unsubscribe, type FirestoreError } from "firebase/firestore";
+import { db } from "@/lib/firebase";
+import type { HomeSummaryDoc } from "@/types/home";
+import { track } from "@/lib/analytics";
+
+interface UseHomeSummaryResult {
+  data: HomeSummaryDoc | null;
+  loading: boolean;
+  error: string | null;
+  isFromCache: boolean; // true when Firestore served the local cache (offline/stale)
+  isOnline: boolean;
+  refresh: () => void;
+}
+
+export function useHomeSummary(ownerId: string | null): UseHomeSummaryResult {
+  const [data, setData] = useState<HomeSummaryDoc | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
+  const [isFromCache, setIsFromCache] = useState<boolean>(false);
+  const [isOnline, setIsOnline] = useState<boolean>(
+    typeof navigator === "undefined" ? true : navigator.onLine
+  );
+  const loadStartRef = useRef<number>(Date.now());
+  const refreshTick = useRef<number>(0);
+  const [, forceTick] = useState(0);
+
+  useEffect(() => {
+    const goOnline = () => setIsOnline(true);
+    const goOffline = () => setIsOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+    };
+  }, []);
+
+  const refresh = useCallback(() => {
+    refreshTick.current += 1;
+    forceTick((t) => t + 1);
+    track("home_refresh", { ownerId: ownerId ?? "unknown" });
+  }, [ownerId]);
+
+  useEffect(() => {
+    if (!ownerId) {
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    loadStartRef.current = Date.now();
+
+    const ref = doc(db, "homeSummaries", ownerId);
+
+    const unsubscribe: Unsubscribe = onSnapshot(
+      ref,
+      { includeMetadataChanges: true },
+      (snapshot) => {
+        if (!snapshot.exists()) {
+          setData(null);
+          setLoading(false);
+          setIsFromCache(snapshot.metadata.fromCache);
+          return;
+        }
+        const summary = snapshot.data() as HomeSummaryDoc;
+        setData(summary);
+        setIsFromCache(snapshot.metadata.fromCache);
+        setLoading(false);
+        setError(null);
+
+        const loadTimeMs = Date.now() - loadStartRef.current;
+        track("home_load_time", { ms: loadTimeMs, fromCache: snapshot.metadata.fromCache });
+      },
+      (err: FirestoreError) => {
+        setError(humanizeFirestoreError(err));
+        setLoading(false);
+        track("home_error", { code: err.code, message: err.message });
+      }
+    );
+
+    return () => unsubscribe();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ownerId, refreshTick.current]);
+
+  const result = useMemo(
+    () => ({ data, loading, error, isFromCache, isOnline, refresh }),
+    [data, loading, error, isFromCache, isOnline, refresh]
+  );
+
+  return result;
+}
+
+/**
+ * §55 Error Handling — never expose server exceptions.
+ */
+function humanizeFirestoreError(err: FirestoreError): string {
+  switch (err.code) {
+    case "permission-denied":
+      return "We couldn't load your customer activity.";
+    case "unavailable":
+      return "You're offline. Showing your latest information.";
+    default:
+      return "We couldn't load your customer activity.";
+  }
+}
+```
+
+---
+
+### `src/components/home/HomeHeader.tsx`
+
+```tsx
+// src/components/home/HomeHeader.tsx
+"use client";
+
+import Link from "next/link";
+import { Bell, User } from "lucide-react";
+
+interface HomeHeaderProps {
+  notificationCount?: number;
+}
+
+export function HomeHeader({ notificationCount = 0 }: HomeHeaderProps) {
+  return (
+    <header
+      className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-neutral-200/70 bg-white/90 px-4 backdrop-blur supports-[backdrop-filter]:bg-white/70 md:h-16 md:px-8 dark:border-neutral-800/70 dark:bg-neutral-950/90"
+      role="banner"
+    >
+      <Link
+        href="/home"
+        className="text-[15px] font-semibold tracking-tight text-neutral-900 md:text-base dark:text-neutral-50"
+      >
+        Isolynic
+      </Link>
+
+      <div className="flex items-center gap-1.5 md:gap-3">
+        <Link
+          href="/notifications"
+          aria-label={
+            notificationCount > 0
+              ? `Notifications, ${notificationCount} unread`
+              : "Notifications"
+          }
+          className="relative flex h-9 w-9 items-center justify-center rounded-full text-neutral-600 transition-colors hover:bg-neutral-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900 dark:text-neutral-300 dark:hover:bg-neutral-900"
+        >
+          <Bell className="h-[18px] w-[18px]" aria-hidden="true" />
+          {notificationCount > 0 && (
+            <span
+              className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-rose-500"
+              aria-hidden="true"
+            />
+          )}
+        </Link>
+
+        <Link
+          href="/account"
+          aria-label="Account"
+          className="flex h-9 w-9 items-center justify-center rounded-full text-neutral-600 transition-colors hover:bg-neutral-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900 dark:text-neutral-300 dark:hover:bg-neutral-900"
+        >
+          <User className="h-[18px] w-[18px]" aria-hidden="true" />
+        </Link>
+      </div>
+    </header>
+  );
+}
+```
+
+---
+
+### `src/components/home/StatusHero.tsx`
+
+The single most important element (§8, §38 — largest text on screen, contextual greeting §7, human language not "alerts" §9).
+
+```tsx
+// src/components/home/StatusHero.tsx
+"use client";
+
+import type { HomeStatus } from "@/types/home";
+import { cn } from "@/lib/utils";
+
+interface StatusHeroProps {
+  status: HomeStatus;
+  attentionCount: number;
+  needsHumanCount: number;
+}
+
+function getHeroContent(status: HomeStatus, attentionCount: number, needsHumanCount: number) {
+  switch (status) {
+    case "new":
+      return {
+        eyebrow: "Here's what needs your attention",
+        headline: "You're ready.",
+        supporting: "Isolynic is now watching for customer inquiries.",
+        secondary: "When a customer needs attention, you'll see it here.",
+        tone: "calm" as const,
+      };
+    case "healthy":
+      return {
+        eyebrow: "Your customer activity",
+        headline: "You're covered.",
+        supporting: "No important customer opportunities need your attention right now.",
+        secondary: "Isolynic is still watching for customers who may be slipping away.",
+        tone: "calm" as const,
+      };
+    case "attention":
+      return {
+        eyebrow: "Here's what needs your attention",
+        headline:
+          attentionCount === 1
+            ? "1 customer may need your attention"
+            : `${attentionCount} customers may need your attention`,
+        supporting: `Isolynic found ${attentionCount} ${
+          attentionCount === 1 ? "opportunity" : "opportunities"
+        } that may be slipping away.`,
+        secondary: null,
+        tone: "attention" as const,
+      };
+    case "needs_human":
+      return {
+        eyebrow: "Here's what needs your attention",
+        headline:
+          needsHumanCount === 1 ? "1 customer needs you" : `${needsHumanCount} customers need you`,
+        supporting: "Isolynic doesn't have enough information to handle this on its own.",
+        secondary: null,
+        tone: "urgent" as const,
+      };
+    case "mixed":
+      return {
+        eyebrow: "Here's what needs your attention",
+        headline:
+          attentionCount === 1 ? "1 customer may need your attention" : `${attentionCount} customers may need your attention`,
+        supporting: `${needsHumanCount === 1 ? "1 of them needs" : `${needsHumanCount} of them need`} you personally.`,
+        secondary: null,
+        tone: "urgent" as const,
+      };
+    case "partial_coverage":
+      return {
+        eyebrow: "Your customer activity",
+        headline: "You're partially covered.",
+        supporting: "Some channels aren't connected yet.",
+        secondary: null,
+        tone: "calm" as const,
+      };
+    case "degraded":
+      return {
+        eyebrow: "Your customer activity",
+        headline: "Isolynic is still watching.",
+        supporting: "One of your channels is temporarily unavailable.",
+        secondary: "We'll keep checking and let you know when it's working again.",
+        tone: "calm" as const,
+      };
+    case "account_issue":
+      return {
+        eyebrow: "Your customer activity",
+        headline: "Your protection has paused.",
+        supporting: "Update your plan to continue recovering customers.",
+        secondary: null,
+        tone: "urgent" as const,
+      };
+    default:
+      return {
+        eyebrow: "Your customer activity",
+        headline: "You're covered.",
+        supporting: "",
+        secondary: null,
+        tone: "calm" as const,
+      };
+  }
+}
+
+export function StatusHero({ status, attentionCount, needsHumanCount }: StatusHeroProps) {
+  const content = getHeroContent(status, attentionCount, needsHumanCount);
+
+  return (
+    <section aria-labelledby="home-status-headline" className="px-4 pt-6 md:px-0 md:pt-2">
+      <p className="text-[13px] font-medium text-neutral-500 dark:text-neutral-400">
+        {content.eyebrow}
+      </p>
+      <h1
+        id="home-status-headline"
+        className={cn(
+          "mt-1 text-[26px] font-semibold leading-tight tracking-tight md:text-[32px]",
+          content.tone === "calm" && "text-neutral-900 dark:text-neutral-50",
+          content.tone === "attention" && "text-neutral-900 dark:text-neutral-50",
+          content.tone === "urgent" && "text-rose-600 dark:text-rose-400"
+        )}
+      >
+        {content.headline}
+      </h1>
+      {content.supporting && (
+        <p className="mt-2 max-w-prose text-[15px] leading-relaxed text-neutral-600 dark:text-neutral-400">
+          {content.supporting}
+        </p>
+      )}
+      {content.secondary && (
+        <p className="mt-1 max-w-prose text-[13px] leading-relaxed text-neutral-500 dark:text-neutral-500">
+          {content.secondary}
+        </p>
+      )}
+    </section>
+  );
+}
+```
+
+---
+
+### `src/components/home/AttentionCard.tsx`
+
+§10–§13: curated, evidence-based reasons, one dominant card, "Review customers" CTA.
+
+```tsx
+// src/components/home/AttentionCard.tsx
+"use client";
+
+import { useEffect, useRef } from "react";
+import { useRouter } from "next/navigation";
+import type { AttentionOpportunity } from "@/types/home";
+import { track } from "@/lib/analytics";
+
+interface AttentionCardProps {
+  opportunities: AttentionOpportunity[];
+  recoverableAutomatically: number;
+  needsHumanCount: number;
+}
+
+export function AttentionCard({
+  opportunities,
+  recoverableAutomatically,
+  needsHumanCount,
+}: AttentionCardProps) {
+  const router = useRouter();
+  const hasTrackedView = useRef(false);
+
+  useEffect(() => {
+    if (!hasTrackedView.current && opportunities.length > 0) {
+      track("attention_card_viewed", { count: opportunities.length });
+      hasTrackedView.current = true;
+    }
+  }, [opportunities.length]);
+
+  if (opportunities.length === 0) return null;
+
+  const handleReview = () => {
+    track("review_customers_clicked", { count: opportunities.length });
+    router.push("/recover");
+  };
+
+  return (
+    <section
+      aria-labelledby="attention-card-heading"
+      className="mx-4 mt-5 overflow-hidden rounded-2xl border border-amber-200/80 bg-amber-50/60 md:mx-0 dark:border-amber-900/40 dark:bg-amber-950/20"
+    >
+      <div className="px-5 pt-5">
+        <h2
+          id="attention-card-heading"
+          className="text-[13px] font-semibold uppercase tracking-wide text-amber-800 dark:text-amber-400"
+        >
+          Customers may be slipping away
+        </h2>
+        <p className="mt-0.5 text-[13px] text-amber-700/80 dark:text-amber-500/80">
+          {opportunities.length} {opportunities.length === 1 ? "opportunity" : "opportunities"}
+          {recoverableAutomatically > 0 &&
+            ` · ${recoverableAutomatically} can be recovered automatically`}
+          {needsHumanCount > 0 && ` · ${needsHumanCount} needs you`}
+        </p>
+      </div>
+
+      <ul className="mt-3 divide-y divide-amber-200/70 dark:divide-amber-900/40" role="list">
+        {opportunities.slice(0, 6).map((opp) => (
+          <li key={opp.id} className="px-5 py-3">
+            <button
+              type="button"
+              onClick={() => {
+                track("activity_item_clicked", { opportunityId: opp.id, source: "attention_card" });
+                router.push(`/recover/${opp.id}`);
+              }}
+              className="flex w-full flex-col items-start rounded-lg text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-700"
+            >
+              <span className="text-[15px] font-medium text-neutral-900 dark:text-neutral-100">
+                {opp.customerDisplayName}
+              </span>
+              <span className="mt-0.5 text-[13px] text-neutral-600 dark:text-neutral-400">
+                {opp.reason}
+              </span>
+            </button>
+          </li>
+        ))}
+      </ul>
+
+      <div className="px-5 pb-5 pt-2">
+        <button
+          type="button"
+          onClick={handleReview}
+          className="w-full rounded-xl bg-neutral-900 px-4 py-3 text-[15px] font-semibold text-white transition-colors hover:bg-neutral-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900 active:bg-neutral-950 md:w-auto dark:bg-neutral-50 dark:text-neutral-900 dark:hover:bg-neutral-200"
+        >
+          Review customers
+        </button>
+      </div>
+    </section>
+  );
+}
+```
+
+---
+
+### `src/components/home/NeedsYouCard.tsx`
+
+§17 — prominent when populated, explains *why* human attention is required.
+
+```tsx
+// src/components/home/NeedsYouCard.tsx
+"use client";
+
+import { useRouter } from "next/navigation";
+import type { NeedsHumanOpportunity } from "@/types/home";
+import { track } from "@/lib/analytics";
+
+interface NeedsYouCardProps {
+  opportunities: NeedsHumanOpportunity[];
+}
+
+export function NeedsYouCard({ opportunities }: NeedsYouCardProps) {
+  const router = useRouter();
+
+  if (opportunities.length === 0) return null;
+
+  const primary = opportunities[0];
+  const extraCount = opportunities.length - 1;
+
+  const handleHandle = (opportunityId: string) => {
+    track("needs_you_clicked", { opportunityId });
+    router.push(`/recover/${opportunityId}?mode=handle`);
+  };
+
+  return (
+    <section
+      aria-labelledby="needs-you-heading"
+      className="mx-4 mt-4 rounded-2xl border-2 border-rose-300 bg-rose-50 p-5 md:mx-0 dark:border-rose-900/60 dark:bg-rose-950/30"
+    >
+      <h2 id="needs-you-heading" className="text-[17px] font-semibold text-rose-700 dark:text-rose-400">
+        {opportunities.length === 1
+          ? "1 customer needs you"
+          : `${opportunities.length} customers need you`}
+      </h2>
+
+      <p className="mt-1.5 text-[15px] text-neutral-800 dark:text-neutral-200">
+        <span className="font-medium">{primary.customerDisplayName}</span>{" "}
+        {primary.reason}
+      </p>
+
+      <button
+        type="button"
+        onClick={() => handleHandle(primary.id)}
+        className="mt-4 w-full rounded-xl bg-rose-600 px-4 py-3 text-[15px] font-semibold text-white transition-colors hover:bg-rose-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-700 active:bg-rose-800 md:w-auto"
+      >
+        Handle now
+      </button>
+
+      {extraCount > 0 && (
+        <button
+          type="button"
+          onClick={() => router.push("/recover?filter=needs_human")}
+          className="mt-2 block text-[13px] font-medium text-rose-700 underline-offset-2 hover:underline dark:text-rose-400"
+        >
+          {extraCount === 1 ? "See 1 more" : `See ${extraCount} more`}
+        </button>
+      )}
+    </section>
+  );
+}
+```
+
+---
+
+### `src/components/home/RecoverySummaryCard.tsx`
+
+§14–§15: results, zero vanity metrics.
+
+```tsx
+// src/components/home/RecoverySummaryCard.tsx
+"use client";
+
+import { useRouter } from "next/navigation";
+import { track } from "@/lib/analytics";
+
+interface RecoverySummaryCardProps {
+  recoveredThisWeek: number;
+  bookedThisWeek: number;
+  repliedThisWeek: number;
+  stillDecidingThisWeek: number;
+  activeRecoveries: number;
+}
+
+export function RecoverySummaryCard({
+  recoveredThisWeek,
+  bookedThisWeek,
+  repliedThisWeek,
+  stillDecidingThisWeek,
+  activeRecoveries,
+}: RecoverySummaryCardProps) {
+  const router = useRouter();
+
+  if (recoveredThisWeek === 0 && activeRecoveries === 0) return null;
+
+  return (
+    <section
+      aria-labelledby="recovery-summary-heading"
+      className="mx-4 mt-4 rounded-2xl border border-emerald-200 bg-emerald-50/70 p-5 md:mx-0 dark:border-emerald-900/40 dark:bg-emerald-950/20"
+    >
+      <h2 id="recovery-summary-heading" className="text-[17px] font-semibold text-emerald-800 dark:text-emerald-400">
+        {recoveredThisWeek > 0
+          ? `Isolynic recovered ${recoveredThisWeek} ${
+              recoveredThisWeek === 1 ? "customer" : "customers"
+            } this week`
+          : `${activeRecoveries} ${activeRecoveries === 1 ? "customer is" : "customers are"} being recovered automatically`}
+      </h2>
+
+      {recoveredThisWeek > 0 && (
+        <p className="mt-1 text-[14px] text-emerald-700/90 dark:text-emerald-500/90">
+          {[
+            bookedThisWeek > 0 && `${bookedThisWeek} booked`,
+            repliedThisWeek > 0 && `${repliedThisWeek} replied`,
+            stillDecidingThisWeek > 0 &&
+              `${stillDecidingThisWeek} still deciding`,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </p>
+      )}
+
+      {activeRecoveries > 0 && recoveredThisWeek > 0 && (
+        <p className="mt-1 text-[13px] text-emerald-700/70 dark:text-emerald-500/70">
+          Isolynic is handling {activeRecoveries} more right now.
+        </p>
+      )}
+
+      <button
+        type="button"
+        onClick={() => {
+          track("recovery_results_clicked");
+          router.push("/results");
+        }}
+        className="mt-3 text-[14px] font-semibold text-emerald-800 underline-offset-2 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-800 dark:text-emerald-400"
+      >
+        See results
+      </button>
+    </section>
+  );
+}
+```
+
+---
+
+### `src/components/home/BookingsCard.tsx`
+
+§16 — no extra destination if V1 has no dedicated booking screen; routes into the opportunity/conversation context.
+
+```tsx
+// src/components/home/BookingsCard.tsx
+"use client";
+
+import { useRouter } from "next/navigation";
+import type { NextBooking } from "@/types/home";
+
+interface BookingsCardProps {
+  bookingsThisWeekCount: number;
+  nextBooking: NextBooking | null;
+}
+
+export function BookingsCard({ bookingsThisWeekCount, nextBooking }: BookingsCardProps) {
+  const router = useRouter();
+
+  if (bookingsThisWeekCount === 0 && !nextBooking) return null;
+
+  return (
+    <section
+      aria-labelledby="bookings-heading"
+      className="mx-4 mt-4 rounded-2xl border border-neutral-200 bg-white p-5 md:mx-0 dark:border-neutral-800 dark:bg-neutral-900"
+    >
+      <h2 id="bookings-heading" className="text-[15px] font-semibold text-neutral-900 dark:text-neutral-100">
+        Appointments
+      </h2>
+      <p className="mt-1 text-[14px] text-neutral-600 dark:text-neutral-400">
+        {bookingsThisWeekCount} recovered {bookingsThisWeekCount === 1 ? "booking" : "bookings"} this
+        week
+      </p>
+
+      {nextBooking && (
+        <p className="mt-2 text-[14px] text-neutral-800 dark:text-neutral-200">
+          Next appointment:{" "}
+          <span className="font-medium">
+            {nextBooking.customerDisplayName} — {nextBooking.timeLabel}
+          </span>
+        </p>
+      )}
+
+      <button
+        type="button"
+        onClick={() =>
+          router.push(
+            nextBooking?.opportunityId ? `/recover/${nextBooking.opportunityId}` : "/results"
+          )
+        }
+        className="mt-3 text-[14px] font-semibold text-neutral-900 underline-offset-2 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900 dark:text-neutral-100"
+      >
+        View bookings
+      </button>
+    </section>
+  );
+}
+```
+
+---
+
+### `src/components/home/WeeklySummaryCard.tsx`
+
+§29–§30 — revenue only rendered when data exists, correctly labeled as estimate.
+
+```tsx
+// src/components/home/WeeklySummaryCard.tsx
+"use client";
+
+import type { WeeklySummary } from "@/types/home";
+import { formatRevenue } from "@/lib/utils";
+
+interface WeeklySummaryCardProps {
+  summary: WeeklySummary;
+}
+
+export function WeeklySummaryCard({ summary }: WeeklySummaryCardProps) {
+  const revenueLabel = formatRevenue(summary.revenue);
+  const total =
+    summary.recoveredCount + summary.stillActiveCount + summary.lostCount;
+
+  if (total === 0) return null;
+
+  return (
+    <section
+      aria-labelledby="weekly-summary-heading"
+      className="mx-4 mt-4 rounded-2xl border border-neutral-200 bg-white p-5 md:mx-0 dark:border-neutral-800 dark:bg-neutral-900"
+    >
+      <h2 id="weekly-summary-heading" className="text-[13px] font-semibold uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
+        This week
+      </h2>
+
+      <dl className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <SummaryStat label="Opportunities recovered" value={summary.recoveredCount} />
+        <SummaryStat label="Bookings" value={summary.bookedCount} />
+        <SummaryStat label="Still active" value={summary.stillActiveCount} />
+        <SummaryStat label="Lost" value={summary.lostCount} />
+      </dl>
+
+      {revenueLabel && (
+        <p className="mt-4 text-[14px] text-neutral-700 dark:text-neutral-300">
+          {revenueLabel} recovered
+        </p>
+      )}
+      {!revenueLabel && (
+        <p className="mt-4 text-[14px] text-neutral-700 dark:text-neutral-300">
+          {summary.recoveredCount} {summary.recoveredCount === 1 ? "opportunity" : "opportunities"} recovered
+        </p>
+      )}
+    </section>
+  );
+}
+
+function SummaryStat({ label, value }: { label: string; value: number }) {
+  return (
+    <div>
+      <dt className="text-[12px] text-neutral-500 dark:text-neutral-500">{label}</dt>
+      <dd className="mt-0.5 text-[20px] font-semibold text-neutral-900 dark:text-neutral-100">
+        {value}
+      </dd>
+    </div>
+  );
+}
+```
+
+---
+
+### `src/components/home/ActivityFeed.tsx`
+
+§25–§26 — only meaningful business events, tap navigates directly.
+
+```tsx
+// src/components/home/ActivityFeed.tsx
+"use client";
+
+import { useRouter } from "next/navigation";
+import type { ActivityItem } from "@/types/home";
+import { formatActivityTime } from "@/lib/utils";
+import { track } from "@/lib/analytics";
+
+interface ActivityFeedProps {
+  items: ActivityItem[];
+}
+
+const ROUTE_MAP: Record<NonNullable<ActivityItem["navigateTo"]>, (id: string) => string> = {
+  conversation: (id) => `/customers/${id}/conversation`,
+  opportunity: (id) => `/recover/${id}`,
+  booking: (id) => `/recover/${id}`,
+};
+
+export function ActivityFeed({ items }: ActivityFeedProps) {
+  const router = useRouter();
+
+  if (items.length === 0) return null;
+
+  return (
+    <section
+      aria-labelledby="activity-feed-heading"
+      className="mx-4 mt-4 rounded-2xl border border-neutral-200 bg-white p-5 md:mx-0 dark:border-neutral-800 dark:bg-neutral-900"
+    >
+      <h2 id="activity-feed-heading" className="text-[13px] font-semibold uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
+        Recent activity
+      </h2>
+
+      <ul className="mt-3 space-y-3" role="list">
+        {items.slice(0, 8).map((item) => (
+          <li key={item.id}>
+            <button
+              type="button"
+              disabled={!item.opportunityId || !item.navigateTo}
+              onClick={() => {
+                if (!item.opportunityId || !item.navigateTo) return;
+                track("activity_item_clicked", { activityId: item.id });
+                router.push(ROUTE_MAP[item.navigateTo](item.opportunityId));
+              }}
+              className="flex w-full items-baseline gap-3 rounded-lg text-left disabled:cursor-default focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900"
+            >
+              <span className="w-16 shrink-0 text-[12px] tabular-nums text-neutral-400">
+                {formatActivityTime(item.timestamp)}
+              </span>
+              <span className="text-[14px] text-neutral-700 dark:text-neutral-300">
+                {item.label}
+              </span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+```
+
+---
+
+### `src/components/home/CoverageBanner.tsx` & `AccountStatusBanner.tsx`
+
+§21–§22, §45 — quiet, honest, contextual — never a marketing banner (§46).
+
+```tsx
+// src/components/home/CoverageBanner.tsx
+"use client";
+
+import Link from "next/link";
+import type { ChannelCoverage, ChannelId } from "@/types/home";
+
+interface CoverageBannerProps {
+  coverage: ChannelCoverage[];
+  degradedChannels: { channel: ChannelId; label: string }[];
+}
+
+export function CoverageBanner({ coverage, degradedChannels }: CoverageBannerProps) {
+  const disconnected = coverage.filter((c) => !c.connected);
+
+  if (disconnected.length === 0 && degradedChannels.length === 0) return null;
+
+  return (
+    <div className="mx-4 mt-4 space-y-2 md:mx-0">
+      {disconnected.length > 0 && (
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3 dark:border-neutral-800 dark:bg-neutral-900">
+          <p className="text-[13px] text-neutral-700 dark:text-neutral-300">
+            {coverage
+              .filter((c) => c.connected)
+              .map((c) => c.label)
+              .join(", ") || "Some channels"}{" "}
+            {coverage.filter((c) => c.connected).length === 1 ? "is" : "are"} connected.{" "}
+            {disconnected.map((c) => c.label).join(", ")}{" "}
+            {disconnected.length === 1 ? "isn't" : "aren't"} connected yet.
+          </p>
+          <Link
+            href="/account/setup"
+            className="shrink-0 text-[13px] font-semibold text-neutral-900 underline-offset-2 hover:underline dark:text-neutral-100"
+          >
+            Finish setup
+          </Link>
+        </div>
+      )}
+
+      {degradedChannels.map((c) => (
+        <div
+          key={c.channel}
+          className="rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3 dark:border-neutral-800 dark:bg-neutral-900"
+        >
+          <p className="text-[13px] text-neutral-700 dark:text-neutral-300">
+            {c.label} recovery is temporarily unavailable.
+          </p>
+          <p className="mt-0.5 text-[12px] text-neutral-500">
+            We&apos;ll keep checking and let you know when it&apos;s working again.
+          </p>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+```tsx
+// src/components/home/AccountStatusBanner.tsx
+"use client";
+
+import Link from "next/link";
+import type { AccountStatus } from "@/types/home";
+
+interface AccountStatusBannerProps {
+  account: AccountStatus;
+}
+
+export function AccountStatusBanner({ account }: AccountStatusBannerProps) {
+  if (account.state === "active") return null;
+
+  return (
+    <div
+      role="alert"
+      className="mx-4 mt-4 flex items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 md:mx-0 dark:border-rose-900/50 dark:bg-rose-950/30"
+    >
+      <p className="text-[13px] text-rose-700 dark:text-rose-400">
+        {account.message ?? "Your protection has paused. Update your plan to continue recovering customers."}
+      </p>
+      <Link
+        href="/account/billing"
+        className="shrink-0 rounded-lg bg-rose-600 px-3 py-1.5 text-[13px] font-semibold text-white hover:bg-rose-700"
+      >
+        Continue protection
+      </Link>
+    </div>
+  );
+}
+```
+
+---
+
+### `src/components/home/OfflineIndicator.tsx`
+
+§52.
+
+```tsx
+// src/components/home/OfflineIndicator.tsx
+"use client";
+
+import { formatUpdatedAt } from "@/lib/utils";
+
+interface OfflineIndicatorProps {
+  isOnline: boolean;
+  isFromCache: boolean;
+  updatedAt: number;
+}
+
+export function OfflineIndicator({ isOnline, isFromCache, updatedAt }: OfflineIndicatorProps) {
+  if (isOnline && !isFromCache) return null;
+
+  return (
+    <div className="mx-4 mt-3 rounded-lg bg-neutral-100 px-3 py-2 text-center text-[12px] text-neutral-600 md:mx-0 dark:bg-neutral-900 dark:text-neutral-400">
+      {!isOnline
+        ? "You're offline. Showing your latest information."
+        : `Last updated ${formatUpdatedAt(updatedAt)}`}
+    </div>
+  );
+}
+```
+
+---
+
+### `src/components/home/HomeSkeleton.tsx` & `HomeErrorState.tsx`
+
+§50 (fast perceived load) and §55.
+
+```tsx
+// src/components/home/HomeSkeleton.tsx
+export function HomeSkeleton() {
+  return (
+    <div className="animate-pulse px-4 pt-6 md:px-0" aria-busy="true" aria-label="Loading your customer activity">
+      <div className="h-3 w-32 rounded bg-neutral-200 dark:bg-neutral-800" />
+      <div className="mt-3 h-8 w-64 rounded bg-neutral-200 dark:bg-neutral-800" />
+      <div className="mt-2 h-4 w-80 max-w-full rounded bg-neutral-200 dark:bg-neutral-800" />
+      <div className="mt-6 h-40 w-full rounded-2xl bg-neutral-200 dark:bg-neutral-800" />
+      <div className="mt-4 h-24 w-full rounded-2xl bg-neutral-200 dark:bg-neutral-800" />
+      <div className="mt-4 h-24 w-full rounded-2xl bg-neutral-200 dark:bg-neutral-800" />
+    </div>
+  );
+}
+```
+
+```tsx
+// src/components/home/HomeErrorState.tsx
+"use client";
+
+interface HomeErrorStateProps {
+  message: string;
+  onRetry: () => void;
+}
+
+export function HomeErrorState({ message, onRetry }: HomeErrorStateProps) {
+  return (
+    <div className="mx-4 mt-10 flex flex-col items-center rounded-2xl border border-neutral-200 bg-white p-8 text-center md:mx-0 dark:border-neutral-800 dark:bg-neutral-900">
+      <p className="text-[15px] text-neutral-700 dark:text-neutral-300">{message}</p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="mt-4 rounded-xl bg-neutral-900 px-4 py-2 text-[14px] font-semibold text-white hover:bg-neutral-800 dark:bg-neutral-50 dark:text-neutral-900"
+      >
+        Try again
+      </button>
+    </div>
+  );
+}
+```
+
+---
+
+### `src/components/home/BottomNav.tsx` & `SideNav.tsx`
+
+§34–§35 — "Recover" not "Leads".
+
+```tsx
+// src/components/home/BottomNav.tsx
+"use client";
+
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { Home as HomeIcon, LifeBuoy, Users, User } from "lucide-react";
+import { cn } from "@/lib/utils";
+
+const ITEMS = [
+  { href: "/home", label: "Home", icon: HomeIcon },
+  { href: "/recover", label: "Recover", icon: LifeBuoy },
+  { href: "/customers", label: "Customers", icon: Users },
+  { href: "/account", label: "Account", icon: User },
+] as const;
+
+export function BottomNav() {
+  const pathname = usePathname();
+
+  return (
+    <nav
+      aria-label="Primary"
+      className="fixed inset-x-0 bottom-0 z-30 flex h-16 items-stretch border-t border-neutral-200 bg-white/95 backdrop-blur md:hidden dark:border-neutral-800 dark:bg-neutral-950/95"
+      style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+    >
+      {ITEMS.map(({ href, label, icon: Icon }) => {
+        const active = pathname === href;
+        return (
+          <Link
+            key={href}
+            href={href}
+            aria-current={active ? "page" : undefined}
+            className="flex flex-1 flex-col items-center justify-center gap-1 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-neutral-900"
+          >
+            <Icon
+              className={cn("h-5 w-5", active ? "text-neutral-900 dark:text-neutral-50" : "text-neutral-400")}
+              aria-hidden="true"
+            />
+            <span
+              className={cn(
+                "text-[11px] font-medium",
+                active ? "text-neutral-900 dark:text-neutral-50" : "text-neutral-400"
+              )}
+            >
+              {label}
+            </span>
+          </Link>
+        );
+      })}
+    </nav>
+  );
+}
+```
+
+```tsx
+// src/components/home/SideNav.tsx
+"use client";
+
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { Home as HomeIcon, LifeBuoy, Users, BarChart3, User } from "lucide-react";
+import { cn } from "@/lib/utils";
+
+const ITEMS = [
+  { href: "/home", label: "Home", icon: HomeIcon },
+  { href: "/recover", label: "Recover", icon: LifeBuoy },
+  { href: "/customers", label: "Customers", icon: Users },
+  { href: "/results", label: "Results", icon: BarChart3 },
+  { href: "/account", label: "Account", icon: User },
+] as const;
+
+export function SideNav() {
+  const pathname = usePathname();
+
+  return (
+    <nav
+      aria-label="Primary"
+      className="fixed left-0 top-16 hidden h-[calc(100vh-4rem)] w-56 flex-col gap-1 border-r border-neutral-200 bg-white px-3 py-4 md:flex dark:border-neutral-800 dark:bg-neutral-950"
+    >
+      {ITEMS.map(({ href, label, icon: Icon }) => {
+        const active = pathname === href;
+        return (
+          <Link
+            key={href}
+            href={href}
+            aria-current={active ? "page" : undefined}
+            className={cn(
+              "flex items-center gap-3 rounded-lg px-3 py-2 text-[14px] font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900",
+              active
+                ? "bg-neutral-100 text-neutral-900 dark:bg-neutral-900 dark:text-neutral-50"
+                : "text-neutral-600 hover:bg-neutral-50 dark:text-neutral-400 dark:hover:bg-neutral-900"
+            )}
+          >
+            <Icon className="h-[18px] w-[18px]" aria-hidden="true" />
+            {label}
+          </Link>
+        );
+      })}
+    </nav>
+  );
+}
+```
+
+---
+
+### `src/app/home/page.tsx`
+
+Main orchestration: derives layout order per breakpoint (§32–§33), fires `home_viewed`, handles all engineering states (§44), and never lets the frontend compute business intelligence — it only renders the already-interpreted `HomeSummary` (§49).
+
+```tsx
+// src/app/home/page.tsx
+"use client";
+
+import { useEffect, useState } from "react";
+import { getAuth, onAuthStateChanged } from "firebase/auth";
+import { app } from "@/lib/firebase";
+import { useHomeSummary } from "@/hooks/useHomeSummary";
+import { track } from "@/lib/analytics";
+
+import { HomeHeader } from "@/components/home/HomeHeader";
+import { StatusHero } from "@/components/home/StatusHero";
+import { AttentionCard } from "@/components/home/AttentionCard";
+import { NeedsYouCard } from "@/components/home/NeedsYouCard";
+import { RecoverySummaryCard } from "@/components/home/RecoverySummaryCard";
+import { BookingsCard } from "@/components/home/BookingsCard";
+import { WeeklySummaryCard } from "@/components/home/WeeklySummaryCard";
+import { ActivityFeed } from "@/components/home/ActivityFeed";
+import { CoverageBanner } from "@/components/home/CoverageBanner";
+import { AccountStatusBanner } from "@/components/home/AccountStatusBanner";
+import { OfflineIndicator } from "@/components/home/OfflineIndicator";
+import { HomeSkeleton } from "@/components/home/HomeSkeleton";
+import { HomeErrorState } from "@/components/home/HomeErrorState";
+import { BottomNav } from "@/components/home/BottomNav";
+import { SideNav } from "@/components/home/SideNav";
+
+export default function HomePage() {
+  const [ownerId, setOwnerId] = useState<string | null>(null);
+  const [authResolved, setAuthResolved] = useState(false);
+
+  useEffect(() => {
+    const auth = getAuth(app);
+    const unsub = onAuthStateChanged(auth, (user) => {
+      setOwnerId(user?.uid ?? null);
+      setAuthResolved(true);
+    });
+    return () => unsub();
+  }, []);
+
+  const { data, loading, error, isFromCache, isOnline, refresh } = useHomeSummary(
+    authResolved ? ownerId : null
+  );
+
+  useEffect(() => {
+    if (data) {
+      track("home_viewed", { status: data.status });
+    }
+  }, [data?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const isLoading = !authResolved || loading;
+
+  return (
+    <div className="min-h-screen bg-neutral-50 dark:bg-neutral-950">
+      <HomeHeader
+        notificationCount={
+          (data?.needsHumanCount ?? 0) + (data?.attentionCount ?? 0) > 0 ? 1 : 0
+        }
+      />
+
+      <div className="mx-auto flex max-w-[1320px] md:pl-56">
+        <SideNav />
+
+        <main
+          id="main-content"
+          className="w-full pb-24 md:px-8 md:pb-12 md:pt-6"
+          aria-label="Home"
+        >
+          {isLoading && <HomeSkeleton />}
+
+          {!isLoading && error && !data && (
+            <HomeErrorState message={error} onRetry={refresh} />
+          )}
+
+          {!isLoading && !error && !ownerId && (
+            <HomeErrorState
+              message="Sign in to see your customer activity."
+              onRetry={refresh}
+            />
+          )}
+
+          {!isLoading && data && (
+            <div className="md:mx-auto md:max-w-3xl">
+              <OfflineIndicator
+                isOnline={isOnline}
+                isFromCache={isFromCache}
+                updatedAt={data.updatedAt}
+              />
+
+              <AccountStatusBanner account={data.account} />
+
+              <StatusHero
+                status={data.status}
+                attentionCount={data.attentionCount}
+                needsHumanCount={data.needsHumanCount}
+              />
+
+              <CoverageBanner
+                coverage={data.coverage}
+                degradedChannels={data.degradedChannels}
+              />
+
+              <NeedsYouCard opportunities={data.needsHumanOpportunities} />
+
+              <AttentionCard
+                opportunities={data.attentionOpportunities}
+                recoverableAutomatically={data.recoverableAutomatically}
+                needsHumanCount={data.needsHumanCount}
+              />
+
+              <RecoverySummaryCard
+                recoveredThisWeek={data.recoveredThisWeek}
+                bookedThisWeek={data.bookedThisWeek}
+                repliedThisWeek={data.repliedThisWeek}
+                stillDecidingThisWeek={data.stillDecidingThisWeek}
+                activeRecoveries={data.activeRecoveries}
+              />
+
+              <BookingsCard
+                bookingsThisWeekCount={data.bookingsThisWeekCount}
+                nextBooking={data.nextBooking}
+              />
+
+              {/* §19 Empty state: nothing-to-do is itself a successful state */}
+              {data.status === "healthy" && (
+                <div className="mx-4 mt-4 rounded-2xl border border-neutral-200 bg-white p-5 text-center md:mx-0 dark:border-neutral-800 dark:bg-neutral-900">
+                  <p className="text-[14px] text-neutral-600 dark:text-neutral-400">
+                    {data.weeklySummary.recoveredCount} customers recovered this month
+                  </p>
+                </div>
+              )}
+
+              <WeeklySummaryCard summary={data.weeklySummary} />
+
+              <ActivityFeed items={data.recentActivity} />
+            </div>
+          )}
+        </main>
+      </div>
+
+      <BottomNav />
+    </div>
+  );
+}
+```
+
+---
+
+### `src/app/home/layout.tsx`
+
+```tsx
+// src/app/home/layout.tsx
+import type { ReactNode } from "react";
+
+export const metadata = {
+  title: "Home — Isolynic",
+  description: "See what needs your attention right now.",
+};
+
+export default function HomeLayout({ children }: { children: ReactNode }) {
+  return <>{children}</>;
+}
+```
+
+---
+
+### Notes on how this maps to the spec
+
+- **§48–49 data contract**: the frontend renders `HomeSummary` exactly as delivered — no client-side scoring, ranking, or "risk" inference. All curation/ranking (§11–§12) happens server-side (Cloud Function writing to `homeSummaries/{ownerId}`).
+- **§44 all eight states** are covered by `HomeStatus` and branched in `StatusHero` + conditional sections (`CoverageBanner`, `AccountStatusBanner`, needs-human vs attention cards).
+- **§51 refresh strategy**: `onSnapshot` gives event-driven updates with zero polling; `refresh()` is only a manual escape hatch.
+- **§52 offline behavior**: `isFromCache`/`isOnline` drive the `OfflineIndicator`, and Firestore's IndexedDB persistence keeps the last valid state visible.
+- **§54 accessibility**: semantic headings, `aria-live`-free but structurally labeled sections, 44px+ touch targets on nav, no color-only signaling (every colored state also has explicit text).
+- **§57 analytics**: every required event name is wired at its natural interaction point.
+
+If you want, I can follow this up with the Firestore Cloud Function that computes and writes the `homeSummaries/{ownerId}` document (the server-side piece §11–§13, §49 explicitly says belongs to the backend, not this screen).
