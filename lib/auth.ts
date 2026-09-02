@@ -1,6 +1,6 @@
-
-// src/lib/auth.ts
 "use client";
+// src/lib/auth.ts
+
 
 import {
   signInWithPopup,

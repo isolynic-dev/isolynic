@@ -1,3 +1,5 @@
+"use client";
+
 import { onAuthStateChanged, type User } from "firebase/auth";
 import { auth } from "@/lib/firebase";
 import { useCallback, useEffect, useState } from "react";
@@ -8,7 +10,7 @@ import {
   persistOnboardingState,
 } from "@/lib/onboarding";
 
-"use client";
+
 
 
 // src/hooks/useReducedMotion.ts

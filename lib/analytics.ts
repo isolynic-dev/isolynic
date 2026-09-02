@@ -1,6 +1,6 @@
-
-// src/lib/analytics.ts
 "use client";
+// src/lib/analytics.ts
+
 
 import { logEvent } from "firebase/analytics";
 import { getFirebaseAnalytics } from "./firebase";

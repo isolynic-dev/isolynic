@@ -1,4 +1,4 @@
-
+"use client";
 // src/app/page.tsx
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -18,9 +18,6 @@ import {
   AuthPanel,
   ExistingAccountPrompt,
 } from "@/components/welcome";
-
-
-"use client";
 
 
 export default function WelcomePage() {

@@ -1,6 +1,6 @@
-
-// src/lib/onboarding.ts
 "use client";
+// src/lib/onboarding.ts
+
 
 import {
   doc,

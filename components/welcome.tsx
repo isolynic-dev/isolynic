@@ -1,3 +1,6 @@
+"use client";
+
+
 import {
   HumanAuthError,
   signInWithGoogle,
@@ -13,7 +16,7 @@ import { useReducedMotion } from "@/hooks/hooks";
 
 
 // src/components/welcome/Header.tsx
-"use client";
+
 
 interface HeaderProps {
   isAuthenticated: boolean;
