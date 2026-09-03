@@ -1,0 +1,2908 @@
+# Isolynic — Screen 6: Customer
+
+Full production code for the Customer screen: types, Firestore data layer, real-time hook, all UI components (mobile/tablet/desktop per the spec's exact composition), and the Cloud Functions needed for identity-safe, cascading, and security-sensitive mutations (notes/smart-notes, mark-not-customer, delete, merge, take-over/resume recovery, edit identity) plus a timeline-generation trigger.
+
+---
+
+## 1. `types/customer.ts`
+
+```typescript
+// types/customer.ts
+// Shared domain types for Screen 6 — Customer.
+// Mirrors the conceptual data model in the spec (§60) without exposing
+// internal fields to the UI layer.
+
+import type { Timestamp } from "firebase/firestore";
+
+/** High-level, human-readable customer state (spec §16). Never expose the
+ * underlying scoring model that produces this — only this enum. */
+export type CustomerCurrentState =
+  | "active"
+  | "needs_attention"
+  | "waiting"
+  | "booked"
+  | "recovered"
+  | "completed"
+  | "lost"
+  | "none";
+
+export type RecoveryState = "idle" | "in_progress" | "succeeded" | "stopped";
+
+export type PreferredChannel = "whatsapp" | "phone" | "web" | "unknown";
+
+export type IdentityConfidence = "confirmed" | "likely" | "uncertain";
+
+export interface CustomerChannels {
+  phone?: string;
+  whatsapp?: string;
+}
+
+export interface CustomerPreferences {
+  communicationTime?: "morning" | "afternoon" | "evening" | "unspecified";
+  language?: string;
+}
+
+/** Root customer document: customers/{customerId} */
+export interface CustomerDoc {
+  id: string;
+  businessId: string;
+  displayName: string | null;
+  phone: string | null;
+  photoUrl: string | null;
+  channels: CustomerChannels;
+  preferredChannel: PreferredChannel;
+  preferences: CustomerPreferences;
+  currentState: CustomerCurrentState;
+  identityConfidence: IdentityConfidence;
+  possibleDuplicateOf: string | null; // customerId, when a merge candidate exists
+  activeOpportunityIds: string[];
+  appointmentIds: string[];
+  conversationIds: string[];
+  isCustomer: boolean; // false after "Mark as not a customer"
+  autoRecoveryBlocked: boolean; // "Don't contact automatically"
+  deletedAt: Timestamp | null;
+  lastContactedAt: Timestamp | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
+export type OpportunityState =
+  | "new"
+  | "waiting_for_customer"
+  | "waiting_for_owner"
+  | "recovering"
+  | "booked"
+  | "completed"
+  | "lost";
+
+/** opportunities/{opportunityId} — summarized on this screen (spec §61, §76) */
+export interface OpportunityDoc {
+  id: string;
+  customerId: string;
+  businessId: string;
+  title: string; // e.g. "Washing machine repair"
+  state: OpportunityState;
+  startedAt: Timestamp;
+  lastActivityAt: Timestamp;
+  estimatedValueMin: number | null;
+  estimatedValueMax: number | null;
+  bookedValue: number | null;
+  currency: string;
+  recoveryState: RecoveryState;
+  recoveryLastMessageAt: Timestamp | null;
+  whyFlagged: string | null; // short human sentence, spec §17
+}
+
+export type TimelineEventType =
+  | "customer_contacted"
+  | "owner_contacted"
+  | "isolynic_contacted"
+  | "quote_discussed"
+  | "appointment_created"
+  | "appointment_changed"
+  | "appointment_completed"
+  | "recovery_started"
+  | "recovery_succeeded"
+  | "opportunity_lost"
+  | "owner_took_over";
+
+export type TimelineActor = "you" | "customer" | "isolynic" | "system";
+
+/** customers/{customerId}/timeline/{eventId} — natural-language only (spec §23) */
+export interface TimelineEventDoc {
+  id: string;
+  type: TimelineEventType;
+  actor: TimelineActor;
+  headline: string; // "Missed call"
+  detail: string | null; // "Sarah called but nobody answered."
+  occurredAt: Timestamp;
+  relatedOpportunityId: string | null;
+}
+
+export type ConversationChannel = "whatsapp" | "phone" | "web" | "isolynic";
+
+/** conversations/{conversationId} */
+export interface ConversationDoc {
+  id: string;
+  customerId: string;
+  channel: ConversationChannel;
+  lastMessagePreview: string | null;
+  lastMessageAt: Timestamp | null;
+}
+
+export type MessageAuthor = "you" | "customer" | "isolynic" | "system";
+
+/** conversations/{conversationId}/messages/{messageId} — preview only, most
+ * recent few (spec §19–20). Full thread lives on Screen 5. */
+export interface MessagePreviewDoc {
+  id: string;
+  author: MessageAuthor;
+  text: string;
+  sentAt: Timestamp;
+}
+
+export type AppointmentStatus = "confirmed" | "pending" | "cancelled" | "completed";
+
+/** appointments/{appointmentId} */
+export interface AppointmentDoc {
+  id: string;
+  customerId: string;
+  opportunityId: string | null;
+  title: string; // "Repair visit"
+  startsAt: Timestamp;
+  status: AppointmentStatus;
+}
+
+/** customers/{customerId}/notes/{noteId} — plain text only (spec §27–28) */
+export interface CustomerNoteDoc {
+  id: string;
+  text: string;
+  createdBy: "owner";
+  createdAt: Timestamp;
+}
+
+/** customers/{customerId}/smartSuggestions/{suggestionId} — unconfirmed
+ * machine-detected notes/preferences (spec §29) */
+export interface SmartSuggestionDoc {
+  id: string;
+  kind: "note" | "preferred_channel" | "preferred_time";
+  summary: string; // "Customer usually asks for afternoon appointments."
+  proposedValue: string;
+  createdAt: Timestamp;
+  status: "pending" | "saved" | "ignored";
+}
+
+/** Aggregated shape the screen actually consumes — assembled client-side
+ * from the above collections (mirrors spec §83's conceptual API shape,
+ * but built from real-time listeners rather than one REST call). */
+export interface CustomerScreenData {
+  customer: CustomerDoc;
+  activeOpportunities: OpportunityDoc[];
+  recentConversation: {
+    conversation: ConversationDoc | null;
+    messages: MessagePreviewDoc[];
+  };
+  timeline: TimelineEventDoc[];
+  timelineHasMore: boolean;
+  appointments: AppointmentDoc[];
+  notes: CustomerNoteDoc[];
+  pendingSuggestions: SmartSuggestionDoc[];
+}
+```
+
+---
+
+## 2. `lib/firebase/customerData.ts`
+
+Real-time Firestore reads. All *writes* that are destructive, cascading, or security-sensitive go through callable Cloud Functions (section 3) instead of direct client writes — enforced by Firestore rules (`notes` create-only for the client is the one exception, kept direct for latency, matched by a rule).
+
+```typescript
+// lib/firebase/customerData.ts
+import {
+  collection,
+  doc,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  where,
+  startAfter,
+  getDocs,
+  addDoc,
+  serverTimestamp,
+  type Unsubscribe,
+  type QueryDocumentSnapshot,
+} from "firebase/firestore";
+import { db } from "@/lib/firebase/config";
+import type {
+  CustomerDoc,
+  OpportunityDoc,
+  ConversationDoc,
+  MessagePreviewDoc,
+  TimelineEventDoc,
+  AppointmentDoc,
+  CustomerNoteDoc,
+  SmartSuggestionDoc,
+} from "@/types/customer";
+
+const TIMELINE_PAGE_SIZE = 12;
+const CONVERSATION_PREVIEW_SIZE = 4;
+
+function withId<T>(d: QueryDocumentSnapshot): T {
+  return { id: d.id, ...d.data() } as T;
+}
+
+/** Subscribe to the root customer document. Fires null on delete/not-found. */
+export function subscribeCustomer(
+  customerId: string,
+  onData: (c: CustomerDoc | null) => void,
+  onError: (e: Error) => void
+): Unsubscribe {
+  return onSnapshot(
+    doc(db, "customers", customerId),
+    (snap) => {
+      if (!snap.exists() || snap.data()?.deletedAt) {
+        onData(null);
+        return;
+      }
+      onData({ id: snap.id, ...snap.data() } as CustomerDoc);
+    },
+    (err) => onError(err)
+  );
+}
+
+/** Active (non-terminal) opportunities for this customer, most-recent first. */
+export function subscribeActiveOpportunities(
+  customerId: string,
+  onData: (opps: OpportunityDoc[]) => void,
+  onError: (e: Error) => void
+): Unsubscribe {
+  const q = query(
+    collection(db, "opportunities"),
+    where("customerId", "==", customerId),
+    where("state", "not-in", ["completed", "lost"]),
+    orderBy("state"),
+    orderBy("lastActivityAt", "desc")
+  );
+  return onSnapshot(
+    q,
+    (snap) => onData(snap.docs.map((d) => withId<OpportunityDoc>(d))),
+    onError
+  );
+}
+
+/** Single most relevant conversation + latest few message previews. */
+export function subscribeRecentConversation(
+  customerId: string,
+  onData: (data: { conversation: ConversationDoc | null; messages: MessagePreviewDoc[] }) => void,
+  onError: (e: Error) => void
+): Unsubscribe {
+  const q = query(
+    collection(db, "conversations"),
+    where("customerId", "==", customerId),
+    orderBy("lastMessageAt", "desc"),
+    limit(1)
+  );
+
+  let unsubMessages: Unsubscribe | null = null;
+
+  const unsubConvo = onSnapshot(
+    q,
+    (snap) => {
+      unsubMessages?.();
+      if (snap.empty) {
+        onData({ conversation: null, messages: [] });
+        return;
+      }
+      const conversation = withId<ConversationDoc>(snap.docs[0]);
+      const msgQuery = query(
+        collection(db, "conversations", conversation.id, "messages"),
+        orderBy("sentAt", "desc"),
+        limit(CONVERSATION_PREVIEW_SIZE)
+      );
+      unsubMessages = onSnapshot(
+        msgQuery,
+        (msgSnap) => {
+          const messages = msgSnap.docs
+            .map((d) => withId<MessagePreviewDoc>(d))
+            .reverse(); // chronological for display
+          onData({ conversation, messages });
+        },
+        onError
+      );
+    },
+    onError
+  );
+
+  return () => {
+    unsubConvo();
+    unsubMessages?.();
+  };
+}
+
+/** First page of timeline, newest first. Returns an unsubscribe + a loader
+ * for older pages (spec §86 — no unlimited history on this screen). */
+export function subscribeTimelineFirstPage(
+  customerId: string,
+  onData: (events: TimelineEventDoc[], hasMore: boolean) => void,
+  onError: (e: Error) => void
+): Unsubscribe {
+  const q = query(
+    collection(db, "customers", customerId, "timeline"),
+    orderBy("occurredAt", "desc"),
+    limit(TIMELINE_PAGE_SIZE + 1)
+  );
+  return onSnapshot(
+    q,
+    (snap) => {
+      const docs = snap.docs.slice(0, TIMELINE_PAGE_SIZE).map((d) => withId<TimelineEventDoc>(d));
+      onData(docs, snap.docs.length > TIMELINE_PAGE_SIZE);
+    },
+    onError
+  );
+}
+
+export async function loadOlderTimelineEvents(
+  customerId: string,
+  after: TimelineEventDoc
+): Promise<{ events: TimelineEventDoc[]; hasMore: boolean }> {
+  const anchor = await getDocs(
+    query(
+      collection(db, "customers", customerId, "timeline"),
+      orderBy("occurredAt", "desc"),
+      where("occurredAt", "==", after.occurredAt),
+      limit(1)
+    )
+  );
+  const cursor = anchor.docs[0];
+  const q = query(
+    collection(db, "customers", customerId, "timeline"),
+    orderBy("occurredAt", "desc"),
+    ...(cursor ? [startAfter(cursor)] : []),
+    limit(TIMELINE_PAGE_SIZE + 1)
+  );
+  const snap = await getDocs(q);
+  const events = snap.docs.slice(0, TIMELINE_PAGE_SIZE).map((d) => withId<TimelineEventDoc>(d));
+  return { events, hasMore: snap.docs.length > TIMELINE_PAGE_SIZE };
+}
+
+export function subscribeAppointments(
+  customerId: string,
+  onData: (appts: AppointmentDoc[]) => void,
+  onError: (e: Error) => void
+): Unsubscribe {
+  const q = query(
+    collection(db, "appointments"),
+    where("customerId", "==", customerId),
+    where("status", "in", ["confirmed", "pending"]),
+    orderBy("startsAt", "asc"),
+    limit(3)
+  );
+  return onSnapshot(
+    q,
+    (snap) => onData(snap.docs.map((d) => withId<AppointmentDoc>(d))),
+    onError
+  );
+}
+
+export function subscribeNotes(
+  customerId: string,
+  onData: (notes: CustomerNoteDoc[]) => void,
+  onError: (e: Error) => void
+): Unsubscribe {
+  const q = query(
+    collection(db, "customers", customerId, "notes"),
+    orderBy("createdAt", "desc"),
+    limit(20)
+  );
+  return onSnapshot(
+    q,
+    (snap) => onData(snap.docs.map((d) => withId<CustomerNoteDoc>(d))),
+    onError
+  );
+}
+
+export function subscribePendingSuggestions(
+  customerId: string,
+  onData: (s: SmartSuggestionDoc[]) => void,
+  onError: (e: Error) => void
+): Unsubscribe {
+  const q = query(
+    collection(db, "customers", customerId, "smartSuggestions"),
+    where("status", "==", "pending"),
+    orderBy("createdAt", "desc"),
+    limit(3)
+  );
+  return onSnapshot(
+    q,
+    (snap) => onData(snap.docs.map((d) => withId<SmartSuggestionDoc>(d))),
+    onError
+  );
+}
+
+/** Direct client write — plain-text note creation is low-risk and latency
+ * sensitive (spec §28 "Saved" should feel instant), so it bypasses a
+ * Cloud Function. Firestore rules restrict this to create-only, owner-role,
+ * <=1000 chars, and only on customers the caller's business owns. */
+export async function createNote(customerId: string, text: string): Promise<void> {
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error("Note text is required.");
+  if (trimmed.length > 1000) throw new Error("Note is too long.");
+  await addDoc(collection(db, "customers", customerId, "notes"), {
+    text: trimmed,
+    createdBy: "owner",
+    createdAt: serverTimestamp(),
+  });
+}
+```
+
+---
+
+## 3. `lib/firebase/customerActions.ts`
+
+Thin client wrapper around the callable Cloud Functions.
+
+```typescript
+// lib/firebase/customerActions.ts
+import { getFunctions, httpsCallable } from "firebase/functions";
+import { app } from "@/lib/firebase/config";
+
+const functions = getFunctions(app);
+
+interface OkResult {
+  ok: true;
+}
+
+async function call<TReq, TRes = OkResult>(name: string, data: TReq): Promise<TRes> {
+  const fn = httpsCallable<TReq, TRes>(functions, name);
+  const result = await fn(data);
+  return result.data;
+}
+
+export const markCustomerNotACustomer = (customerId: string) =>
+  call("markCustomerNotACustomer", { customerId });
+
+export const deleteCustomer = (customerId: string) =>
+  call("deleteCustomer", { customerId });
+
+export const mergeCustomers = (primaryCustomerId: string, duplicateCustomerId: string) =>
+  call("mergeCustomers", { primaryCustomerId, duplicateCustomerId });
+
+export const editCustomerIdentity = (
+  customerId: string,
+  updates: { displayName?: string; phone?: string; preferredChannel?: "whatsapp" | "phone" | "web" }
+) => call("editCustomerIdentity", { customerId, updates });
+
+export const takeOverConversation = (customerId: string, opportunityId?: string) =>
+  call("takeOverConversation", { customerId, opportunityId });
+
+export const resumeAutomaticRecovery = (customerId: string, opportunityId: string) =>
+  call("resumeAutomaticRecovery", { customerId, opportunityId });
+
+export const stopRecovery = (customerId: string, opportunityId: string) =>
+  call("stopRecovery", { customerId, opportunityId });
+
+export const setAutoRecoveryBlocked = (customerId: string, blocked: boolean) =>
+  call("setAutoRecoveryBlocked", { customerId, blocked });
+
+export const confirmSmartSuggestion = (customerId: string, suggestionId: string, accept: boolean) =>
+  call("confirmSmartSuggestion", { customerId, suggestionId, accept });
+
+export const sendCustomerMessage = (
+  customerId: string,
+  opportunityId: string | null,
+  text: string
+) => call<{ customerId: string; opportunityId: string | null; text: string }, { ok: true; queued: boolean }>(
+  "sendCustomerMessage",
+  { customerId, opportunityId, text }
+);
+```
+
+---
+
+## 4. `hooks/useCustomerScreen.ts`
+
+```typescript
+// hooks/useCustomerScreen.ts
+"use client";
+
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import {
+  subscribeCustomer,
+  subscribeActiveOpportunities,
+  subscribeRecentConversation,
+  subscribeTimelineFirstPage,
+  loadOlderTimelineEvents,
+  subscribeAppointments,
+  subscribeNotes,
+  subscribePendingSuggestions,
+} from "@/lib/firebase/customerData";
+import type {
+  CustomerDoc,
+  OpportunityDoc,
+  ConversationDoc,
+  MessagePreviewDoc,
+  TimelineEventDoc,
+  AppointmentDoc,
+  CustomerNoteDoc,
+  SmartSuggestionDoc,
+} from "@/types/customer";
+
+type LoadState = "loading" | "ready" | "not_found" | "error";
+
+interface UseCustomerScreenResult {
+  loadState: LoadState;
+  customer: CustomerDoc | null;
+  activeOpportunities: OpportunityDoc[];
+  conversation: ConversationDoc | null;
+  messages: MessagePreviewDoc[];
+  timeline: TimelineEventDoc[];
+  timelineHasMore: boolean;
+  loadMoreTimeline: () => Promise<void>;
+  timelineLoadingMore: boolean;
+  appointments: AppointmentDoc[];
+  notes: CustomerNoteDoc[];
+  pendingSuggestions: SmartSuggestionDoc[];
+  isOffline: boolean;
+  error: Error | null;
+  retry: () => void;
+}
+
+/** Composes every real-time slice this screen needs into one view-model,
+ * so the identity block can render before slower sections resolve
+ * (spec §54 — skeletons per-section, identity first). */
+export function useCustomerScreen(customerId: string | null): UseCustomerScreenResult {
+  const [retryTick, setRetryTick] = useState(0);
+  const [loadState, setLoadState] = useState<LoadState>("loading");
+  const [error, setError] = useState<Error | null>(null);
+
+  const [customer, setCustomer] = useState<CustomerDoc | null>(null);
+  const [activeOpportunities, setActiveOpportunities] = useState<OpportunityDoc[]>([]);
+  const [conversation, setConversation] = useState<ConversationDoc | null>(null);
+  const [messages, setMessages] = useState<MessagePreviewDoc[]>([]);
+  const [timeline, setTimeline] = useState<TimelineEventDoc[]>([]);
+  const [timelineHasMore, setTimelineHasMore] = useState(false);
+  const [timelineLoadingMore, setTimelineLoadingMore] = useState(false);
+  const [appointments, setAppointments] = useState<AppointmentDoc[]>([]);
+  const [notes, setNotes] = useState<CustomerNoteDoc[]>([]);
+  const [pendingSuggestions, setPendingSuggestions] = useState<SmartSuggestionDoc[]>([]);
+  const [isOffline, setIsOffline] = useState(
+    typeof navigator !== "undefined" ? !navigator.onLine : false
+  );
+
+  const lastTimelineDocRef = useRef<TimelineEventDoc | null>(null);
+
+  useEffect(() => {
+    const goOffline = () => setIsOffline(true);
+    const goOnline = () => setIsOffline(false);
+    window.addEventListener("offline", goOffline);
+    window.addEventListener("online", goOnline);
+    return () => {
+      window.removeEventListener("offline", goOffline);
+      window.removeEventListener("online", goOnline);
+    };
+  }, []);
+
+  const handleError = useCallback((e: Error) => {
+    setError(e);
+    setLoadState("error");
+  }, []);
+
+  useEffect(() => {
+    if (!customerId) return;
+    setLoadState("loading");
+    setError(null);
+
+    const unsubCustomer = subscribeCustomer(
+      customerId,
+      (c) => {
+        setCustomer(c);
+        setLoadState((prev) => (c === null ? "not_found" : prev === "error" ? "error" : "ready"));
+      },
+      handleError
+    );
+
+    const unsubOpps = subscribeActiveOpportunities(customerId, setActiveOpportunities, handleError);
+
+    const unsubConvo = subscribeRecentConversation(
+      customerId,
+      (d) => {
+        setConversation(d.conversation);
+        setMessages(d.messages);
+      },
+      handleError
+    );
+
+    const unsubTimeline = subscribeTimelineFirstPage(
+      customerId,
+      (events, hasMore) => {
+        setTimeline(events);
+        setTimelineHasMore(hasMore);
+        lastTimelineDocRef.current = events[events.length - 1] ?? null;
+      },
+      handleError
+    );
+
+    const unsubAppts = subscribeAppointments(customerId, setAppointments, handleError);
+    const unsubNotes = subscribeNotes(customerId, setNotes, handleError);
+    const unsubSuggestions = subscribePendingSuggestions(customerId, setPendingSuggestions, handleError);
+
+    return () => {
+      unsubCustomer();
+      unsubOpps();
+      unsubConvo();
+      unsubTimeline();
+      unsubAppts();
+      unsubNotes();
+      unsubSuggestions();
+    };
+  }, [customerId, retryTick, handleError]);
+
+  const loadMoreTimeline = useCallback(async () => {
+    if (!customerId || !lastTimelineDocRef.current || timelineLoadingMore) return;
+    setTimelineLoadingMore(true);
+    try {
+      const { events, hasMore } = await loadOlderTimelineEvents(customerId, lastTimelineDocRef.current);
+      setTimeline((prev) => [...prev, ...events]);
+      setTimelineHasMore(hasMore);
+      if (events.length) lastTimelineDocRef.current = events[events.length - 1];
+    } catch (e) {
+      // Non-fatal: older history failing to load shouldn't break the screen.
+      console.error("Failed to load older timeline events", e);
+    } finally {
+      setTimelineLoadingMore(false);
+    }
+  }, [customerId, timelineLoadingMore]);
+
+  const retry = useCallback(() => setRetryTick((t) => t + 1), []);
+
+  return useMemo(
+    () => ({
+      loadState,
+      customer,
+      activeOpportunities,
+      conversation,
+      messages,
+      timeline,
+      timelineHasMore,
+      loadMoreTimeline,
+      timelineLoadingMore,
+      appointments,
+      notes,
+      pendingSuggestions,
+      isOffline,
+      error,
+      retry,
+    }),
+    [
+      loadState,
+      customer,
+      activeOpportunities,
+      conversation,
+      messages,
+      timeline,
+      timelineHasMore,
+      loadMoreTimeline,
+      timelineLoadingMore,
+      appointments,
+      notes,
+      pendingSuggestions,
+      isOffline,
+      error,
+      retry,
+    ]
+  );
+}
+```
+
+---
+
+## 5. UI primitives
+
+### `components/customer/Avatar.tsx`
+
+```tsx
+// components/customer/Avatar.tsx
+"use client";
+
+import { useMemo } from "react";
+
+interface AvatarProps {
+  name: string | null;
+  photoUrl: string | null;
+  size?: number;
+}
+
+function getInitials(name: string | null): string {
+  if (!name) return "";
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
+/** Three states per spec §9: real photo, initials, or generic person icon. */
+export function Avatar({ name, photoUrl, size = 56 }: AvatarProps) {
+  const initials = useMemo(() => getInitials(name), [name]);
+  const style = { width: size, height: size };
+
+  if (photoUrl) {
+    return (
+      <img
+        src={photoUrl}
+        alt=""
+        role="presentation"
+        style={style}
+        className="rounded-full object-cover bg-neutral-200"
+      />
+    );
+  }
+
+  if (initials) {
+    return (
+      <div
+        style={style}
+        aria-hidden="true"
+        className="rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center font-semibold"
+      >
+        {initials}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={style}
+      aria-hidden="true"
+      className="rounded-full bg-neutral-200 text-neutral-500 flex items-center justify-center"
+    >
+      <svg width={size * 0.5} height={size * 0.5} viewBox="0 0 24 24" fill="currentColor">
+        <path d="M12 12a5 5 0 1 0 0-10 5 5 0 0 0 0 10Zm0 2c-4.42 0-8 2.24-8 5v1a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-1c0-2.76-3.58-5-8-5Z" />
+      </svg>
+    </div>
+  );
+}
+```
+
+### `components/customer/ConfirmDialog.tsx`
+
+```tsx
+// components/customer/ConfirmDialog.tsx
+"use client";
+
+import { useEffect, useRef } from "react";
+
+interface ConfirmDialogProps {
+  open: boolean;
+  title: string;
+  description: string;
+  confirmLabel: string;
+  cancelLabel?: string;
+  destructive?: boolean;
+  busy?: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}
+
+/** Used for every "confirmation required" action in spec §73:
+ * delete customer, disable automatic recovery, mark not a customer. */
+export function ConfirmDialog({
+  open,
+  title,
+  description,
+  confirmLabel,
+  cancelLabel = "Cancel",
+  destructive = false,
+  busy = false,
+  onConfirm,
+  onCancel,
+}: ConfirmDialogProps) {
+  const confirmRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (open) confirmRef.current?.focus();
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onCancel]);
+
+  if (!open) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 p-4"
+      role="presentation"
+      onClick={onCancel}
+    >
+      <div
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="confirm-dialog-title"
+        aria-describedby="confirm-dialog-desc"
+        onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl"
+      >
+        <h2 id="confirm-dialog-title" className="text-base font-semibold text-neutral-900">
+          {title}
+        </h2>
+        <p id="confirm-dialog-desc" className="mt-2 text-sm text-neutral-600">
+          {description}
+        </p>
+        <div className="mt-5 flex gap-3 justify-end">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={busy}
+            className="px-4 py-2 rounded-lg text-sm font-medium text-neutral-700 hover:bg-neutral-100 min-h-[44px]"
+          >
+            {cancelLabel}
+          </button>
+          <button
+            ref={confirmRef}
+            type="button"
+            onClick={onConfirm}
+            disabled={busy}
+            className={`px-4 py-2 rounded-lg text-sm font-medium text-white min-h-[44px] ${
+              destructive ? "bg-red-600 hover:bg-red-700" : "bg-indigo-600 hover:bg-indigo-700"
+            } disabled:opacity-60`}
+          >
+            {busy ? "Please wait…" : confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+### `components/customer/Skeletons.tsx`
+
+```tsx
+// components/customer/Skeletons.tsx
+export function IdentitySkeleton() {
+  return (
+    <div className="flex items-center gap-4 animate-pulse" aria-hidden="true">
+      <div className="w-14 h-14 rounded-full bg-neutral-200" />
+      <div className="space-y-2">
+        <div className="h-4 w-32 bg-neutral-200 rounded" />
+        <div className="h-3 w-24 bg-neutral-200 rounded" />
+      </div>
+    </div>
+  );
+}
+
+export function CardSkeleton({ lines = 3 }: { lines?: number }) {
+  return (
+    <div className="animate-pulse space-y-2 rounded-xl border border-neutral-200 p-4" aria-hidden="true">
+      {Array.from({ length: lines }).map((_, i) => (
+        <div key={i} className="h-3 bg-neutral-200 rounded" style={{ width: `${90 - i * 15}%` }} />
+      ))}
+    </div>
+  );
+}
+```
+
+---
+
+## 6. Section components
+
+### `components/customer/CustomerIdentity.tsx`
+
+```tsx
+// components/customer/CustomerIdentity.tsx
+"use client";
+
+import { Avatar } from "./Avatar";
+import type { CustomerDoc } from "@/types/customer";
+
+function formatChannel(channel: CustomerDoc["preferredChannel"]): string | null {
+  switch (channel) {
+    case "whatsapp":
+      return "WhatsApp";
+    case "phone":
+      return "Phone";
+    case "web":
+      return "Web";
+    default:
+      return null;
+  }
+}
+
+function formatRelativeTime(ms: number | null): string | null {
+  if (ms === null) return null;
+  const diff = Date.now() - ms;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+interface CustomerIdentityProps {
+  customer: CustomerDoc;
+}
+
+/** Spec §8–10: name, contact, channel, last-activity; graceful degradation
+ * for unknown/partial identity (§55); "possibly the same customer" for
+ * unresolved identity matches rather than silent merging (§10). */
+export function CustomerIdentity({ customer }: CustomerIdentityProps) {
+  const name = customer.displayName ?? "Unknown customer";
+  const lastContacted = formatRelativeTime(
+    customer.lastContactedAt ? customer.lastContactedAt.toMillis() : null
+  );
+  const channelLabel = formatChannel(customer.preferredChannel);
+
+  return (
+    <div>
+      <div className="flex items-center gap-4">
+        <Avatar name={customer.displayName} photoUrl={customer.photoUrl} />
+        <div>
+          <h1 className="text-lg font-semibold text-neutral-900">{name}</h1>
+          {customer.phone && <p className="text-sm text-neutral-600">{customer.phone}</p>}
+          {channelLabel && <p className="text-sm text-neutral-500">{channelLabel}</p>}
+        </div>
+      </div>
+
+      {lastContacted && (
+        <p className="mt-2 text-xs text-neutral-500">Last contacted {lastContacted}</p>
+      )}
+
+      {customer.identityConfidence === "uncertain" && customer.possibleDuplicateOf && (
+        <div
+          role="status"
+          className="mt-3 rounded-lg bg-amber-50 text-amber-800 text-sm px-3 py-2"
+        >
+          Possibly the same customer as another record.
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+### `components/customer/CustomerActions.tsx`
+
+```tsx
+// components/customer/CustomerActions.tsx
+"use client";
+
+import type { CustomerDoc, OpportunityDoc } from "@/types/customer";
+
+interface CustomerActionsProps {
+  customer: CustomerDoc;
+  activeOpportunities: OpportunityDoc[];
+  onMessage: () => void;
+  onCall: () => void;
+  onViewOpportunity: () => void;
+}
+
+/** Spec §11–14: Message / Call / View opportunity. The most prominent
+ * action reflects context (waiting on the owner => Message is emphasized). */
+export function CustomerActions({
+  customer,
+  activeOpportunities,
+  onMessage,
+  onCall,
+  onViewOpportunity,
+}: CustomerActionsProps) {
+  const hasChannel = Boolean(customer.channels.whatsapp || customer.channels.phone);
+  const hasPhoneForCall = Boolean(customer.phone || customer.channels.phone);
+  const messageIsPrimary = customer.currentState === "needs_attention" || customer.currentState === "waiting";
+
+  const oppLabel =
+    activeOpportunities.length === 0
+      ? null
+      : activeOpportunities.length === 1
+      ? "View opportunity"
+      : `${activeOpportunities.length} active opportunities`;
+
+  const buttonBase =
+    "min-h-[48px] px-4 rounded-xl text-sm font-medium flex-1 flex items-center justify-center gap-2 transition-colors";
+
+  return (
+    <div className="flex flex-wrap gap-3">
+      <button
+        type="button"
+        onClick={onMessage}
+        disabled={!hasChannel}
+        aria-label="Message customer"
+        className={`${buttonBase} ${
+          messageIsPrimary
+            ? "bg-indigo-600 text-white hover:bg-indigo-700"
+            : "bg-neutral-100 text-neutral-800 hover:bg-neutral-200"
+        } disabled:opacity-50 disabled:cursor-not-allowed`}
+      >
+        Message
+      </button>
+
+      <button
+        type="button"
+        onClick={onCall}
+        disabled={!hasPhoneForCall}
+        aria-label="Call customer"
+        className={`${buttonBase} bg-neutral-100 text-neutral-800 hover:bg-neutral-200 disabled:opacity-50 disabled:cursor-not-allowed`}
+      >
+        Call
+      </button>
+
+      {oppLabel && (
+        <button
+          type="button"
+          onClick={onViewOpportunity}
+          className={`${buttonBase} bg-neutral-100 text-neutral-800 hover:bg-neutral-200`}
+        >
+          {oppLabel}
+        </button>
+      )}
+    </div>
+  );
+}
+```
+
+### `components/customer/CurrentSituationCard.tsx`
+
+```tsx
+// components/customer/CurrentSituationCard.tsx
+"use client";
+
+import type { CustomerDoc, OpportunityDoc } from "@/types/customer";
+
+interface CurrentSituationCardProps {
+  customer: CustomerDoc;
+  primaryOpportunity: OpportunityDoc | null;
+  onRecoverNow: () => void;
+  onHandleMyself: () => void;
+  onStopRecovery: () => void;
+  onViewConversation: () => void;
+  onLetIsolynicHelpAgain: () => void;
+}
+
+const toneStyles: Record<string, string> = {
+  neutral: "bg-neutral-50 border-neutral-200 text-neutral-800",
+  attention: "bg-amber-50 border-amber-200 text-amber-900",
+  success: "bg-emerald-50 border-emerald-200 text-emerald-900",
+  warning: "bg-orange-50 border-orange-200 text-orange-900",
+};
+
+function formatRelative(ms: number): string {
+  const diff = Date.now() - ms;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${Math.max(mins, 0)} minute${mins === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+/** Spec §15–17, §41–44: the most important section on the screen. Every
+ * state renders as plain language — never a confidence score (§17, §97). */
+export function CurrentSituationCard({
+  customer,
+  primaryOpportunity,
+  onRecoverNow,
+  onHandleMyself,
+  onStopRecovery,
+  onViewConversation,
+  onLetIsolynicHelpAgain,
+}: CurrentSituationCardProps) {
+  const state = customer.currentState;
+
+  const buttonClass =
+    "min-h-[48px] px-4 rounded-xl text-sm font-medium flex-1 flex items-center justify-center";
+
+  if (state === "none") {
+    return (
+      <div className={`rounded-xl border p-4 ${toneStyles.neutral}`} role="status">
+        <p className="font-medium">Nothing needs your attention</p>
+        <p className="text-sm mt-1 opacity-80">This customer has no active opportunity right now.</p>
+      </div>
+    );
+  }
+
+  if (state === "needs_attention") {
+    return (
+      <div className={`rounded-xl border p-4 ${toneStyles.attention}`} role="status" aria-live="polite">
+        <p className="font-medium">May be slipping away</p>
+        {primaryOpportunity?.whyFlagged && (
+          <p className="text-sm mt-1">{primaryOpportunity.whyFlagged}</p>
+        )}
+        <div className="mt-3 flex gap-3">
+          <button type="button" onClick={onRecoverNow} className={`${buttonClass} bg-amber-600 text-white hover:bg-amber-700`}>
+            Recover now
+          </button>
+          <button type="button" onClick={onHandleMyself} className={`${buttonClass} bg-white text-amber-900 border border-amber-300 hover:bg-amber-100`}>
+            Handle myself
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (state === "waiting") {
+    if (primaryOpportunity?.recoveryState === "in_progress") {
+      const lastMsg = primaryOpportunity.recoveryLastMessageAt
+        ? formatRelative(primaryOpportunity.recoveryLastMessageAt.toMillis())
+        : null;
+      return (
+        <div className={`rounded-xl border p-4 ${toneStyles.attention}`} role="status">
+          <p className="font-medium">We're trying to bring this customer back.</p>
+          {lastMsg && <p className="text-sm mt-1">Last message sent {lastMsg}.</p>}
+          <div className="mt-3 flex gap-3">
+            <button type="button" onClick={onViewConversation} className={`${buttonClass} bg-white text-amber-900 border border-amber-300 hover:bg-amber-100`}>
+              View conversation
+            </button>
+            <button type="button" onClick={onStopRecovery} className={`${buttonClass} bg-neutral-100 text-neutral-800 hover:bg-neutral-200`}>
+              Stop recovery
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div className={`rounded-xl border p-4 ${toneStyles.neutral}`} role="status">
+        <p className="font-medium">You're waiting for the customer.</p>
+      </div>
+    );
+  }
+
+  if (state === "active") {
+    return (
+      <div className={`rounded-xl border p-4 ${toneStyles.neutral}`} role="status">
+        <p className="font-medium">You're currently helping this customer.</p>
+      </div>
+    );
+  }
+
+  if (state === "booked") {
+    return (
+      <div className={`rounded-xl border p-4 ${toneStyles.success}`} role="status">
+        <p className="font-medium">Booked</p>
+        <p className="text-sm mt-1 opacity-90">Appointment booked.</p>
+      </div>
+    );
+  }
+
+  if (state === "recovered") {
+    return (
+      <div className={`rounded-xl border p-4 ${toneStyles.success}`} role="status">
+        <p className="font-medium">Recovered</p>
+        <p className="text-sm mt-1 opacity-90">Isolynic helped bring this customer back.</p>
+      </div>
+    );
+  }
+
+  if (state === "completed") {
+    return (
+      <div className={`rounded-xl border p-4 ${toneStyles.neutral}`} role="status">
+        <p className="font-medium">This customer's request is complete.</p>
+      </div>
+    );
+  }
+
+  // lost
+  return (
+    <div className={`rounded-xl border p-4 ${toneStyles.neutral}`} role="status">
+      <p className="font-medium">This opportunity ended without a booking.</p>
+    </div>
+  );
+}
+```
+
+### `components/customer/OpportunitySummary.tsx`
+
+```tsx
+// components/customer/OpportunitySummary.tsx
+"use client";
+
+import type { OpportunityDoc } from "@/types/customer";
+
+function formatDate(ms: number): string {
+  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function stateLabel(state: OpportunityDoc["state"]): string {
+  switch (state) {
+    case "new":
+      return "New";
+    case "waiting_for_customer":
+      return "Waiting for customer";
+    case "waiting_for_owner":
+      return "Waiting for you";
+    case "recovering":
+      return "Recovery in progress";
+    case "booked":
+      return "Booked";
+    case "completed":
+      return "Completed";
+    case "lost":
+      return "Lost";
+  }
+}
+
+function formatValue(opp: OpportunityDoc): string {
+  if (opp.bookedValue !== null) {
+    return `${opp.currency} ${opp.bookedValue.toLocaleString()}`;
+  }
+  if (opp.estimatedValueMin !== null && opp.estimatedValueMax !== null) {
+    return `Estimated opportunity: ${opp.currency} ${opp.estimatedValueMin.toLocaleString()}–${opp.estimatedValueMax.toLocaleString()}`;
+  }
+  return "Value not recorded";
+}
+
+interface OpportunitySummaryProps {
+  opportunities: OpportunityDoc[];
+  onView: (opportunityId: string) => void;
+}
+
+/** Spec §18, §76: compact opportunity summary — never a collapsed "customer
+ * value", each opportunity keeps its own value. */
+export function OpportunitySummary({ opportunities, onView }: OpportunitySummaryProps) {
+  if (opportunities.length === 0) return null;
+
+  return (
+    <section aria-labelledby="opportunity-heading" className="rounded-xl border border-neutral-200 p-4">
+      <h2 id="opportunity-heading" className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
+        {opportunities.length > 1 ? "Active opportunities" : "Active opportunity"}
+      </h2>
+      <ul className="mt-2 space-y-3">
+        {opportunities.map((opp) => (
+          <li key={opp.id}>
+            <p className="font-medium text-neutral-900">{opp.title}</p>
+            <p className="text-sm text-neutral-600">{stateLabel(opp.state)}</p>
+            <p className="text-xs text-neutral-500 mt-1">
+              Started {formatDate(opp.startedAt.toMillis())} · Last activity{" "}
+              {formatDate(opp.lastActivityAt.toMillis())}
+            </p>
+            <p className="text-xs text-neutral-500">{formatValue(opp)}</p>
+            <button
+              type="button"
+              onClick={() => onView(opp.id)}
+              className="mt-2 text-sm font-medium text-indigo-600 hover:text-indigo-700"
+            >
+              View opportunity
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+```
+
+### `components/customer/ConversationPreview.tsx`
+
+```tsx
+// components/customer/ConversationPreview.tsx
+"use client";
+
+import type { ConversationDoc, MessagePreviewDoc } from "@/types/customer";
+
+const authorLabel: Record<MessagePreviewDoc["author"], string> = {
+  you: "You",
+  customer: "Customer",
+  isolynic: "Isolynic",
+  system: "System",
+};
+
+interface ConversationPreviewProps {
+  conversation: ConversationDoc | null;
+  messages: MessagePreviewDoc[];
+  onViewFull: () => void;
+}
+
+/** Spec §19–20, §38: recent messages only, actor always labeled explicitly
+ * (never color-only) so it's clear who said what. */
+export function ConversationPreview({ conversation, messages, onViewFull }: ConversationPreviewProps) {
+  return (
+    <section aria-labelledby="conversation-heading" className="rounded-xl border border-neutral-200 p-4">
+      <h2 id="conversation-heading" className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
+        Recent conversation
+      </h2>
+
+      {!conversation || messages.length === 0 ? (
+        <p className="mt-2 text-sm text-neutral-500">No previous conversation yet.</p>
+      ) : (
+        <ul className="mt-3 space-y-2">
+          {messages.map((m) => (
+            <li key={m.id} className="text-sm">
+              <span className="font-medium text-neutral-800">{authorLabel[m.author]}: </span>
+              <span className="text-neutral-700">{m.text}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <button
+        type="button"
+        onClick={onViewFull}
+        disabled={!conversation}
+        className="mt-3 text-sm font-medium text-indigo-600 hover:text-indigo-700 disabled:text-neutral-300 disabled:cursor-not-allowed"
+      >
+        View full conversation
+      </button>
+    </section>
+  );
+}
+```
+
+### `components/customer/Timeline.tsx`
+
+```tsx
+// components/customer/Timeline.tsx
+"use client";
+
+import type { TimelineEventDoc } from "@/types/customer";
+
+const actorLabel: Record<TimelineEventDoc["actor"], string> = {
+  you: "You",
+  customer: "Customer",
+  isolynic: "Isolynic",
+  system: "System",
+};
+
+function formatDay(ms: number): string {
+  const date = new Date(ms);
+  const today = new Date();
+  const isToday = date.toDateString() === today.toDateString();
+  if (isToday) return "Today";
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+interface TimelineProps {
+  events: TimelineEventDoc[];
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
+}
+
+/** Spec §21–23, §86: natural-language, grouped-by-day history with
+ * pagination — never implementation terminology, never unlimited history. */
+export function Timeline({ events, hasMore, loadingMore, onLoadMore }: TimelineProps) {
+  if (events.length === 0) {
+    return (
+      <section aria-labelledby="history-heading" className="rounded-xl border border-neutral-200 p-4">
+        <h2 id="history-heading" className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
+          History
+        </h2>
+        <p className="mt-2 text-sm text-neutral-500">
+          No previous history. This is your first recorded interaction with this customer.
+        </p>
+      </section>
+    );
+  }
+
+  let lastDay = "";
+
+  return (
+    <section aria-labelledby="history-heading" className="rounded-xl border border-neutral-200 p-4">
+      <h2 id="history-heading" className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
+        History
+      </h2>
+      <ol className="mt-3 space-y-3">
+        {events.map((event) => {
+          const day = formatDay(event.occurredAt.toMillis());
+          const showDay = day !== lastDay;
+          lastDay = day;
+          return (
+            <li key={event.id}>
+              {showDay && <p className="text-xs font-semibold text-neutral-400 mb-1">{day}</p>}
+              <p className="text-sm font-medium text-neutral-800">
+                <span className="text-neutral-500">{actorLabel[event.actor]} · </span>
+                {event.headline}
+              </p>
+              {event.detail && <p className="text-sm text-neutral-600">{event.detail}</p>}
+            </li>
+          );
+        })}
+      </ol>
+
+      {hasMore && (
+        <button
+          type="button"
+          onClick={onLoadMore}
+          disabled={loadingMore}
+          className="mt-3 text-sm font-medium text-indigo-600 hover:text-indigo-700 disabled:opacity-60"
+        >
+          {loadingMore ? "Loading…" : "Load earlier history"}
+        </button>
+      )}
+    </section>
+  );
+}
+```
+
+### `components/customer/AppointmentSummary.tsx`
+
+```tsx
+// components/customer/AppointmentSummary.tsx
+"use client";
+
+import type { AppointmentDoc } from "@/types/customer";
+
+function formatDateTime(ms: number): string {
+  const date = new Date(ms);
+  const dateStr = date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+  const timeStr = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  return `${dateStr} · ${timeStr}`;
+}
+
+function statusLabel(status: AppointmentDoc["status"]): string {
+  switch (status) {
+    case "confirmed":
+      return "Confirmed";
+    case "pending":
+      return "Pending confirmation";
+    case "cancelled":
+      return "Cancelled";
+    case "completed":
+      return "Completed";
+  }
+}
+
+interface AppointmentSummaryProps {
+  appointments: AppointmentDoc[];
+  onView: (id: string) => void;
+  onChange: (id: string) => void;
+  onCancel: (id: string) => void;
+  onViewAll: () => void;
+}
+
+/** Spec §24–25: next appointment first; "View N appointments" if more than one. */
+export function AppointmentSummary({ appointments, onView, onChange, onCancel, onViewAll }: AppointmentSummaryProps) {
+  return (
+    <section aria-labelledby="appointments-heading" className="rounded-xl border border-neutral-200 p-4">
+      <h2 id="appointments-heading" className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
+        Appointments
+      </h2>
+
+      {appointments.length === 0 ? (
+        <p className="mt-2 text-sm text-neutral-500">No appointments yet.</p>
+      ) : (
+        <>
+          <div className="mt-2">
+            <p className="font-medium text-neutral-900">{formatDateTime(appointments[0].startsAt.toMillis())}</p>
+            <p className="text-sm text-neutral-600">{appointments[0].title}</p>
+            <p className="text-sm text-neutral-500">{statusLabel(appointments[0].status)}</p>
+            <div className="mt-2 flex gap-4">
+              <button type="button" onClick={() => onView(appointments[0].id)} className="text-sm font-medium text-indigo-600 hover:text-indigo-700">
+                View
+              </button>
+              <button type="button" onClick={() => onChange(appointments[0].id)} className="text-sm font-medium text-neutral-600 hover:text-neutral-800">
+                Change
+              </button>
+              <button type="button" onClick={() => onCancel(appointments[0].id)} className="text-sm font-medium text-red-600 hover:text-red-700">
+                Cancel
+              </button>
+            </div>
+          </div>
+
+          {appointments.length > 1 && (
+            <button type="button" onClick={onViewAll} className="mt-3 text-sm font-medium text-indigo-600 hover:text-indigo-700">
+              View {appointments.length} appointments
+            </button>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+```
+
+### `components/customer/CustomerNotes.tsx`
+
+```tsx
+// components/customer/CustomerNotes.tsx
+"use client";
+
+import { useState } from "react";
+import type { CustomerNoteDoc, SmartSuggestionDoc } from "@/types/customer";
+import { createNote } from "@/lib/firebase/customerData";
+import { confirmSmartSuggestion } from "@/lib/firebase/customerActions";
+
+interface CustomerNotesProps {
+  customerId: string;
+  notes: CustomerNoteDoc[];
+  pendingSuggestions: SmartSuggestionDoc[];
+}
+
+/** Spec §27–30: plain-text notes only, no custom fields; smart suggestions
+ * require explicit Save/Ignore rather than silently becoming fact (§29). */
+export function CustomerNotes({ customerId, notes, pendingSuggestions }: CustomerNotesProps) {
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [justSaved, setJustSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [suggestionBusy, setSuggestionBusy] = useState<string | null>(null);
+
+  async function handleSave() {
+    if (!draft.trim()) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await createNote(customerId, draft);
+      setDraft("");
+      setAdding(false);
+      setJustSaved(true);
+      setTimeout(() => setJustSaved(false), 2000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't save the note.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleSuggestion(suggestion: SmartSuggestionDoc, accept: boolean) {
+    setSuggestionBusy(suggestion.id);
+    try {
+      await confirmSmartSuggestion(customerId, suggestion.id, accept);
+    } finally {
+      setSuggestionBusy(null);
+    }
+  }
+
+  return (
+    <section aria-labelledby="notes-heading" className="rounded-xl border border-neutral-200 p-4">
+      <h2 id="notes-heading" className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
+        Notes
+      </h2>
+
+      {pendingSuggestions.map((s) => (
+        <div key={s.id} className="mt-2 rounded-lg bg-indigo-50 text-indigo-900 text-sm p-3">
+          <p>We noticed: {s.summary}</p>
+          <div className="mt-2 flex gap-3">
+            <button
+              type="button"
+              onClick={() => handleSuggestion(s, true)}
+              disabled={suggestionBusy === s.id}
+              className="text-sm font-medium text-indigo-700 hover:text-indigo-900"
+            >
+              Save to customer
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSuggestion(s, false)}
+              disabled={suggestionBusy === s.id}
+              className="text-sm font-medium text-neutral-500 hover:text-neutral-700"
+            >
+              Ignore
+            </button>
+          </div>
+        </div>
+      ))}
+
+      {notes.length === 0 ? (
+        <p className="mt-2 text-sm text-neutral-500">Nothing to remember yet.</p>
+      ) : (
+        <ul className="mt-2 space-y-2">
+          {notes.map((n) => (
+            <li key={n.id} className="text-sm text-neutral-700">
+              {n.text}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {adding ? (
+        <div className="mt-3">
+          <textarea
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="Write something you'll want to remember…"
+            maxLength={1000}
+            rows={3}
+            className="w-full rounded-lg border border-neutral-300 p-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          />
+          {error && <p className="mt-1 text-sm text-red-600">{error}</p>}
+          <div className="mt-2 flex gap-3">
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={saving || !draft.trim()}
+              className="min-h-[44px] px-4 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700 disabled:opacity-60"
+            >
+              {saving ? "Saving…" : "Save"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAdding(false);
+                setDraft("");
+                setError(null);
+              }}
+              disabled={saving}
+              className="min-h-[44px] px-4 rounded-lg text-sm font-medium text-neutral-600 hover:bg-neutral-100"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setAdding(true)}
+          className="mt-3 text-sm font-medium text-indigo-600 hover:text-indigo-700"
+        >
+          Add a note
+        </button>
+      )}
+
+      {justSaved && (
+        <p role="status" className="mt-2 text-sm text-emerald-600">
+          Saved
+        </p>
+      )}
+    </section>
+  );
+}
+```
+
+### `components/customer/CustomerMenu.tsx`
+
+```tsx
+// components/customer/CustomerMenu.tsx
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+
+interface CustomerMenuProps {
+  autoRecoveryBlocked: boolean;
+  onEdit: () => void;
+  onMarkNotCustomer: () => void;
+  onDelete: () => void;
+  onToggleBlockMessages: () => void;
+}
+
+/** Spec §33–36, §69: deliberately tiny — Edit, Mark as not a customer,
+ * Delete, and (optionally) Block messages. No technical controls. */
+export function CustomerMenu({
+  autoRecoveryBlocked,
+  onEdit,
+  onMarkNotCustomer,
+  onDelete,
+  onToggleBlockMessages,
+}: CustomerMenuProps) {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onClickOutside(e: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onClickOutside);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onClickOutside);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  function choose(action: () => void) {
+    setOpen(false);
+    action();
+  }
+
+  return (
+    <div ref={containerRef} className="relative">
+      <button
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label="More options"
+        onClick={() => setOpen((o) => !o)}
+        className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-full hover:bg-neutral-100"
+      >
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <circle cx="5" cy="12" r="2" />
+          <circle cx="12" cy="12" r="2" />
+          <circle cx="19" cy="12" r="2" />
+        </svg>
+      </button>
+
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 mt-2 w-56 rounded-xl border border-neutral-200 bg-white shadow-lg py-1 z-40"
+        >
+          <button role="menuitem" onClick={() => choose(onEdit)} className="w-full text-left px-4 py-2 text-sm text-neutral-800 hover:bg-neutral-50">
+            Edit customer
+          </button>
+          <button role="menuitem" onClick={() => choose(onToggleBlockMessages)} className="w-full text-left px-4 py-2 text-sm text-neutral-800 hover:bg-neutral-50">
+            {autoRecoveryBlocked ? "Allow automatic messages" : "Don't contact this customer automatically"}
+          </button>
+          <button role="menuitem" onClick={() => choose(onMarkNotCustomer)} className="w-full text-left px-4 py-2 text-sm text-neutral-800 hover:bg-neutral-50">
+            Mark as not a customer
+          </button>
+          <button role="menuitem" onClick={() => choose(onDelete)} className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50">
+            Delete customer
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+### `components/customer/EditCustomerDialog.tsx`
+
+```tsx
+// components/customer/EditCustomerDialog.tsx
+"use client";
+
+import { useState } from "react";
+import type { CustomerDoc } from "@/types/customer";
+import { editCustomerIdentity } from "@/lib/firebase/customerActions";
+
+interface EditCustomerDialogProps {
+  open: boolean;
+  customer: CustomerDoc;
+  onClose: () => void;
+}
+
+/** Spec §34: editing is limited to name, phone, and preferred channel — no
+ * CRM-style fields. */
+export function EditCustomerDialog({ open, customer, onClose }: EditCustomerDialogProps) {
+  const [name, setName] = useState(customer.displayName ?? "");
+  const [phone, setPhone] = useState(customer.phone ?? "");
+  const [channel, setChannel] = useState<"whatsapp" | "phone" | "web">(
+    customer.preferredChannel === "unknown" ? "whatsapp" : customer.preferredChannel
+  );
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!open) return null;
+
+  async function handleSave() {
+    setSaving(true);
+    setError(null);
+    try {
+      await editCustomerIdentity(customer.id, {
+        displayName: name.trim() || undefined,
+        phone: phone.trim() || undefined,
+        preferredChannel: channel,
+      });
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't save changes.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="edit-customer-title"
+        onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl"
+      >
+        <h2 id="edit-customer-title" className="text-base font-semibold text-neutral-900">
+          Edit customer
+        </h2>
+
+        <div className="mt-4 space-y-3">
+          <label className="block">
+            <span className="text-sm font-medium text-neutral-700">Name</span>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-neutral-300 p-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </label>
+          <label className="block">
+            <span className="text-sm font-medium text-neutral-700">Phone</span>
+            <input
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              inputMode="tel"
+              className="mt-1 w-full rounded-lg border border-neutral-300 p-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </label>
+          <label className="block">
+            <span className="text-sm font-medium text-neutral-700">Preferred communication channel</span>
+            <select
+              value={channel}
+              onChange={(e) => setChannel(e.target.value as "whatsapp" | "phone" | "web")}
+              className="mt-1 w-full rounded-lg border border-neutral-300 p-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            >
+              <option value="whatsapp">WhatsApp</option>
+              <option value="phone">Phone</option>
+              <option value="web">Web</option>
+            </select>
+          </label>
+        </div>
+
+        {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
+
+        <div className="mt-5 flex gap-3 justify-end">
+          <button type="button" onClick={onClose} disabled={saving} className="px-4 py-2 rounded-lg text-sm font-medium text-neutral-700 hover:bg-neutral-100 min-h-[44px]">
+            Cancel
+          </button>
+          <button type="button" onClick={handleSave} disabled={saving} className="px-4 py-2 rounded-lg text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 min-h-[44px] disabled:opacity-60">
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+---
+
+## 7. Main screen — `app/customers/[customerId]/page.tsx`
+
+```tsx
+// app/customers/[customerId]/page.tsx
+"use client";
+
+import { useCallback, useMemo, useState } from "react";
+import { useRouter, useParams, useSearchParams } from "next/navigation";
+import { useCustomerScreen } from "@/hooks/useCustomerScreen";
+import { CustomerIdentity } from "@/components/customer/CustomerIdentity";
+import { CustomerActions } from "@/components/customer/CustomerActions";
+import { CurrentSituationCard } from "@/components/customer/CurrentSituationCard";
+import { OpportunitySummary } from "@/components/customer/OpportunitySummary";
+import { ConversationPreview } from "@/components/customer/ConversationPreview";
+import { Timeline } from "@/components/customer/Timeline";
+import { AppointmentSummary } from "@/components/customer/AppointmentSummary";
+import { CustomerNotes } from "@/components/customer/CustomerNotes";
+import { CustomerMenu } from "@/components/customer/CustomerMenu";
+import { EditCustomerDialog } from "@/components/customer/EditCustomerDialog";
+import { ConfirmDialog } from "@/components/customer/ConfirmDialog";
+import { IdentitySkeleton, CardSkeleton } from "@/components/customer/Skeletons";
+import {
+  markCustomerNotACustomer,
+  deleteCustomer,
+  takeOverConversation,
+  resumeAutomaticRecovery,
+  stopRecovery,
+  setAutoRecoveryBlocked,
+} from "@/lib/firebase/customerActions";
+
+type PendingConfirm =
+  | { kind: "delete" }
+  | { kind: "mark_not_customer" }
+  | { kind: "block_messages"; nextBlocked: boolean }
+  | null;
+
+/** Screen 6 — Customer. Responsive: single column on mobile (spec §46),
+ * hybrid two-column on tablet (§47), sticky left identity panel + scrolling
+ * right "memory" column on desktop (§48–49). */
+export default function CustomerScreenPage() {
+  const router = useRouter();
+  const params = useParams<{ customerId: string }>();
+  const searchParams = useSearchParams();
+  const returnTo = searchParams.get("from"); // preserves back-navigation context (§5, §59)
+
+  const customerId = params?.customerId ?? null;
+  const {
+    loadState,
+    customer,
+    activeOpportunities,
+    conversation,
+    messages,
+    timeline,
+    timelineHasMore,
+    loadMoreTimeline,
+    timelineLoadingMore,
+    appointments,
+    notes,
+    pendingSuggestions,
+    isOffline,
+    retry,
+  } = useCustomerScreen(customerId);
+
+  const [editOpen, setEditOpen] = useState(false);
+  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+
+  const primaryOpportunity = activeOpportunities[0] ?? null;
+
+  const goBack = useCallback(() => {
+    if (returnTo) router.push(returnTo);
+    else router.back();
+  }, [returnTo, router]);
+
+  const handleMessage = useCallback(() => {
+    if (!customer) return;
+    if (!customer.channels.whatsapp && !customer.channels.phone) {
+      setActionNotice("We don't have a messaging channel for this customer yet.");
+      return;
+    }
+    router.push(`/conversations?customerId=${customer.id}&from=/customers/${customer.id}`);
+  }, [customer, router]);
+
+  const handleCall = useCallback(() => {
+    if (!customer) return;
+    const number = customer.phone ?? customer.channels.phone;
+    if (!number) return;
+    window.location.href = `tel:${number}`;
+  }, [customer]);
+
+  const handleViewOpportunity = useCallback(() => {
+    if (!customer) return;
+    if (activeOpportunities.length === 1) {
+      router.push(`/opportunities/${activeOpportunities[0].id}?from=/customers/${customer.id}`);
+    } else if (activeOpportunities.length > 1) {
+      router.push(`/customers/${customer.id}/opportunities`);
+    }
+  }, [customer, activeOpportunities, router]);
+
+  const handleRecoverNow = useCallback(async () => {
+    if (!customer || !primaryOpportunity) return;
+    try {
+      await resumeAutomaticRecovery(customer.id, primaryOpportunity.id);
+    } catch (e) {
+      setActionNotice(e instanceof Error ? e.message : "Couldn't start recovery.");
+    }
+  }, [customer, primaryOpportunity]);
+
+  const handleHandleMyself = useCallback(async () => {
+    if (!customer) return;
+    try {
+      await takeOverConversation(customer.id, primaryOpportunity?.id);
+    } catch (e) {
+      setActionNotice(e instanceof Error ? e.message : "Couldn't take over the conversation.");
+    }
+  }, [customer, primaryOpportunity]);
+
+  const handleStopRecovery = useCallback(async () => {
+    if (!customer || !primaryOpportunity) return;
+    try {
+      await stopRecovery(customer.id, primaryOpportunity.id);
+    } catch (e) {
+      setActionNotice(e instanceof Error ? e.message : "Couldn't stop recovery.");
+    }
+  }, [customer, primaryOpportunity]);
+
+  const handleLetIsolynicHelpAgain = useCallback(async () => {
+    if (!customer || !primaryOpportunity) return;
+    try {
+      await resumeAutomaticRecovery(customer.id, primaryOpportunity.id);
+    } catch (e) {
+      setActionNotice(e instanceof Error ? e.message : "Couldn't resume Isolynic.");
+    }
+  }, [customer, primaryOpportunity]);
+
+  async function handleConfirm() {
+    if (!pendingConfirm || !customer) return;
+    setConfirmBusy(true);
+    try {
+      if (pendingConfirm.kind === "delete") {
+        await deleteCustomer(customer.id);
+        setPendingConfirm(null);
+        goBack();
+        return;
+      }
+      if (pendingConfirm.kind === "mark_not_customer") {
+        await markCustomerNotACustomer(customer.id);
+      }
+      if (pendingConfirm.kind === "block_messages") {
+        await setAutoRecoveryBlocked(customer.id, pendingConfirm.nextBlocked);
+      }
+      setPendingConfirm(null);
+    } catch (e) {
+      setActionNotice(e instanceof Error ? e.message : "That action couldn't be completed.");
+      setPendingConfirm(null);
+    } finally {
+      setConfirmBusy(false);
+    }
+  }
+
+  const confirmCopy = useMemo(() => {
+    switch (pendingConfirm?.kind) {
+      case "delete":
+        return {
+          title: "Delete this customer?",
+          description:
+            "This removes the customer record from Isolynic. Information may also be removed from related conversations where applicable.",
+          confirmLabel: "Delete",
+          destructive: true,
+        };
+      case "mark_not_customer":
+        return {
+          title: "Mark as not a customer?",
+          description: "We'll stop treating this person as a customer opportunity.",
+          confirmLabel: "Mark as not a customer",
+          destructive: false,
+        };
+      case "block_messages":
+        return pendingConfirm.nextBlocked
+          ? {
+              title: "Stop automatic messages?",
+              description: "Isolynic will stop automatic messages to this customer.",
+              confirmLabel: "Don't contact automatically",
+              destructive: false,
+            }
+          : {
+              title: "Allow automatic messages?",
+              description: "Isolynic will be able to send automatic recovery messages to this customer again.",
+              confirmLabel: "Allow automatic messages",
+              destructive: false,
+            };
+      default:
+        return null;
+    }
+  }, [pendingConfirm]);
+
+  // ---- Error / not-found states (spec §72) --------------------------------
+
+  if (loadState === "not_found") {
+    return (
+      <div className="max-w-md mx-auto p-6 text-center">
+        <p className="text-neutral-800 font-medium">We couldn't load this customer's information.</p>
+        <div className="mt-4 flex justify-center gap-3">
+          <button onClick={goBack} className="min-h-[44px] px-4 rounded-lg text-sm font-medium text-neutral-700 hover:bg-neutral-100">
+            Go back
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (loadState === "error") {
+    return (
+      <div className="max-w-md mx-auto p-6 text-center">
+        <p className="text-neutral-800 font-medium">We couldn't load this customer's information.</p>
+        <div className="mt-4 flex justify-center gap-3">
+          <button onClick={retry} className="min-h-[44px] px-4 rounded-lg text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700">
+            Try again
+          </button>
+          <button onClick={goBack} className="min-h-[44px] px-4 rounded-lg text-sm font-medium text-neutral-700 hover:bg-neutral-100">
+            Go back
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const identityReady = loadState === "ready" && customer !== null;
+
+  return (
+    <div className="min-h-screen bg-white">
+      {/* Header (§7) */}
+      <header className="sticky top-0 z-30 flex items-center justify-between border-b border-neutral-200 bg-white px-4 py-3">
+        <button onClick={goBack} aria-label="Back" className="min-w-[44px] min-h-[44px] flex items-center justify-center -ml-2">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+            <path d="M15 18l-6-6 6-6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+        <h1 className="text-sm font-semibold text-neutral-900">Customer</h1>
+        {identityReady ? (
+          <CustomerMenu
+            autoRecoveryBlocked={customer.autoRecoveryBlocked}
+            onEdit={() => setEditOpen(true)}
+            onMarkNotCustomer={() => setPendingConfirm({ kind: "mark_not_customer" })}
+            onDelete={() => setPendingConfirm({ kind: "delete" })}
+            onToggleBlockMessages={() =>
+              setPendingConfirm({ kind: "block_messages", nextBlocked: !customer.autoRecoveryBlocked })
+            }
+          />
+        ) : (
+          <div className="w-11" />
+        )}
+      </header>
+
+      {isOffline && (
+        <div role="status" className="bg-neutral-800 text-white text-xs text-center py-1.5">
+          You're offline. Some information may be out of date.
+        </div>
+      )}
+
+      {actionNotice && (
+        <div role="status" className="mx-4 mt-3 rounded-lg bg-neutral-100 text-neutral-700 text-sm px-3 py-2 flex justify-between items-center">
+          <span>{actionNotice}</span>
+          <button onClick={() => setActionNotice(null)} aria-label="Dismiss" className="ml-3 text-neutral-500">
+            ×
+          </button>
+        </div>
+      )}
+
+      {/* Content — responsive (§46–49) */}
+      <main className="max-w-[1280px] mx-auto px-4 py-5 lg:grid lg:grid-cols-[38%_62%] lg:gap-8">
+        {/* Left / primary column */}
+        <div className="lg:sticky lg:top-16 lg:self-start space-y-5">
+          {!identityReady ? (
+            <IdentitySkeleton />
+          ) : (
+            <>
+              <CustomerIdentity customer={customer} />
+              <CustomerActions
+                customer={customer}
+                activeOpportunities={activeOpportunities}
+                onMessage={handleMessage}
+                onCall={handleCall}
+                onViewOpportunity={handleViewOpportunity}
+              />
+              <CurrentSituationCard
+                customer={customer}
+                primaryOpportunity={primaryOpportunity}
+                onRecoverNow={handleRecoverNow}
+                onHandleMyself={handleHandleMyself}
+                onStopRecovery={handleStopRecovery}
+                onViewConversation={() =>
+                  router.push(`/conversations?customerId=${customer.id}&from=/customers/${customer.id}`)
+                }
+                onLetIsolynicHelpAgain={handleLetIsolynicHelpAgain}
+              />
+              <OpportunitySummary
+                opportunities={activeOpportunities}
+                onView={(id) => router.push(`/opportunities/${id}?from=/customers/${customer.id}`)}
+              />
+              <AppointmentSummary
+                appointments={appointments}
+                onView={(id) => router.push(`/appointments/${id}`)}
+                onChange={(id) => router.push(`/appointments/${id}/edit`)}
+                onCancel={(id) => router.push(`/appointments/${id}/cancel`)}
+                onViewAll={() => router.push(`/customers/${customer.id}/appointments`)}
+              />
+              <CustomerNotes customerId={customer.id} notes={notes} pendingSuggestions={pendingSuggestions} />
+            </>
+          )}
+        </div>
+
+        {/* Right / history column */}
+        <div className="mt-5 lg:mt-0 space-y-5">
+          {!identityReady ? (
+            <>
+              <CardSkeleton lines={4} />
+              <CardSkeleton lines={5} />
+            </>
+          ) : (
+            <>
+              <ConversationPreview
+                conversation={conversation}
+                messages={messages}
+                onViewFull={() =>
+                  router.push(`/conversations?customerId=${customer.id}&from=/customers/${customer.id}`)
+                }
+              />
+              <Timeline
+                events={timeline}
+                hasMore={timelineHasMore}
+                loadingMore={timelineLoadingMore}
+                onLoadMore={loadMoreTimeline}
+              />
+            </>
+          )}
+        </div>
+      </main>
+
+      {identityReady && (
+        <EditCustomerDialog open={editOpen} customer={customer} onClose={() => setEditOpen(false)} />
+      )}
+
+      {confirmCopy && (
+        <ConfirmDialog
+          open={Boolean(pendingConfirm)}
+          title={confirmCopy.title}
+          description={confirmCopy.description}
+          confirmLabel={confirmCopy.confirmLabel}
+          destructive={confirmCopy.destructive}
+          busy={confirmBusy}
+          onConfirm={handleConfirm}
+          onCancel={() => setPendingConfirm(null)}
+        />
+      )}
+    </div>
+  );
+}
+```
+
+---
+
+## 8. Cloud Functions (v2, TypeScript)
+
+These are the mutations the spec treats as security- or consistency-sensitive: cascading deletion, identity merging, disabling autonomous messaging, take-over/resume of recovery, and identity edits (all require confirmation per §73, or write across multiple documents that must stay consistent). A Firestore trigger builds the natural-language timeline (§21–23) from the underlying opportunity/appointment/conversation writes, keeping timeline generation out of client hands entirely.
+
+### `functions/src/customer/types.ts`
+
+```typescript
+// functions/src/customer/types.ts
+import { Timestamp } from "firebase-admin/firestore";
+
+export type CustomerCurrentState =
+  | "active"
+  | "needs_attention"
+  | "waiting"
+  | "booked"
+  | "recovered"
+  | "completed"
+  | "lost"
+  | "none";
+
+export interface CustomerRecord {
+  businessId: string;
+  displayName: string | null;
+  phone: string | null;
+  photoUrl: string | null;
+  channels: { phone?: string; whatsapp?: string };
+  preferredChannel: "whatsapp" | "phone" | "web" | "unknown";
+  currentState: CustomerCurrentState;
+  isCustomer: boolean;
+  autoRecoveryBlocked: boolean;
+  activeOpportunityIds: string[];
+  appointmentIds: string[];
+  conversationIds: string[];
+  deletedAt: Timestamp | null;
+  updatedAt: Timestamp;
+}
+```
+
+### `functions/src/customer/authz.ts`
+
+```typescript
+// functions/src/customer/authz.ts
+import { HttpsError, CallableRequest } from "firebase-functions/v2/https";
+import { getFirestore } from "firebase-admin/firestore";
+
+const db = getFirestore();
+
+/** Verifies the caller is an authenticated member of the business that owns
+ * this customer record, and returns both docs for convenience. Every
+ * callable below starts with this — no mutation trusts client-supplied
+ * businessId. */
+export async function requireOwnedCustomer(request: CallableRequest, customerId: string) {
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "You must be signed in.");
+  }
+  if (!customerId || typeof customerId !== "string") {
+    throw new HttpsError("invalid-argument", "customerId is required.");
+  }
+
+  const customerRef = db.collection("customers").doc(customerId);
+  const snap = await customerRef.get();
+  if (!snap.exists || snap.data()?.deletedAt) {
+    throw new HttpsError("not-found", "Customer not found.");
+  }
+
+  const businessId = snap.data()!.businessId as string;
+  const memberSnap = await db
+    .collection("businesses")
+    .doc(businessId)
+    .collection("members")
+    .doc(request.auth.uid)
+    .get();
+
+  if (!memberSnap.exists) {
+    throw new HttpsError("permission-denied", "You don't have access to this customer.");
+  }
+
+  return { customerRef, customerSnap: snap, businessId };
+}
+```
+
+### `functions/src/customer/mutations.ts`
+
+```typescript
+// functions/src/customer/mutations.ts
+import { onCall, HttpsError } from "firebase-functions/v2/https";
+import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
+import { requireOwnedCustomer } from "./authz";
+
+const db = getFirestore();
+
+// ---------------------------------------------------------------------------
+// Mark as not a customer (spec §35)
+// ---------------------------------------------------------------------------
+export const markCustomerNotACustomer = onCall(async (request) => {
+  const { customerId } = request.data as { customerId: string };
+  const { customerRef } = await requireOwnedCustomer(request, customerId);
+
+  await customerRef.update({
+    isCustomer: false,
+    currentState: "none",
+    autoRecoveryBlocked: true,
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+
+  await customerRef.collection("timeline").add({
+    type: "owner_took_over",
+    actor: "you",
+    headline: "Marked as not a customer",
+    detail: null,
+    occurredAt: FieldValue.serverTimestamp(),
+    relatedOpportunityId: null,
+  });
+
+  return { ok: true as const };
+});
+
+// ---------------------------------------------------------------------------
+// Delete customer (spec §36) — soft delete + cascading cleanup of dependent
+// collections' customer-facing linkage. Underlying message logs are only
+// removed where the product's retention policy allows it (kept here as a
+// scoped, resumable batched job rather than a promise of full erasure).
+// ---------------------------------------------------------------------------
+export const deleteCustomer = onCall(async (request) => {
+  const { customerId } = request.data as { customerId: string };
+  const { customerRef, businessId } = await requireOwnedCustomer(request, customerId);
+
+  const now = FieldValue.serverTimestamp();
+
+  await db.runTransaction(async (tx) => {
+    tx.update(customerRef, {
+      deletedAt: now,
+      currentState: "none",
+      autoRecoveryBlocked: true,
+      updatedAt: now,
+    });
+  });
+
+  // Detach dependent opportunities/appointments/conversations from active
+  // surfaces (e.g. Recovery Queue) without silently deleting cross-linked
+  // business records the customer doesn't exclusively own.
+  const [opps, appts, convos] = await Promise.all([
+    db.collection("opportunities").where("customerId", "==", customerId).where("businessId", "==", businessId).get(),
+    db.collection("appointments").where("customerId", "==", customerId).get(),
+    db.collection("conversations").where("customerId", "==", customerId).get(),
+  ]);
+
+  const batch = db.batch();
+  opps.docs.forEach((d) => batch.update(d.ref, { state: "lost", customerDeleted: true }));
+  appts.docs.forEach((d) => batch.update(d.ref, { status: "cancelled" }));
+  convos.docs.forEach((d) => batch.update(d.ref, { customerDeleted: true }));
+  await batch.commit();
+
+  return { ok: true as const };
+});
+
+// ---------------------------------------------------------------------------
+// Merge customers (spec §68) — owner-confirmed only, never automatic.
+// ---------------------------------------------------------------------------
+export const mergeCustomers = onCall(async (request) => {
+  const { primaryCustomerId, duplicateCustomerId } = request.data as {
+    primaryCustomerId: string;
+    duplicateCustomerId: string;
+  };
+
+  if (primaryCustomerId === duplicateCustomerId) {
+    throw new HttpsError("invalid-argument", "Cannot merge a customer with itself.");
+  }
+
+  const { customerRef: primaryRef, businessId: primaryBiz } = await requireOwnedCustomer(request, primaryCustomerId);
+  const { customerRef: dupRef, businessId: dupBiz } = await requireOwnedCustomer(request, duplicateCustomerId);
+
+  if (primaryBiz !== dupBiz) {
+    throw new HttpsError("failed-precondition", "Customers belong to different businesses.");
+  }
+
+  const [primarySnap, dupSnap] = await Promise.all([primaryRef.get(), dupRef.get()]);
+  const primary = primarySnap.data()!;
+  const dup = dupSnap.data()!;
+
+  const mergedChannels = { ...dup.channels, ...primary.channels };
+  const mergedOppIds = Array.from(new Set([...(primary.activeOpportunityIds ?? []), ...(dup.activeOpportunityIds ?? [])]));
+  const mergedApptIds = Array.from(new Set([...(primary.appointmentIds ?? []), ...(dup.appointmentIds ?? [])]));
+  const mergedConvoIds = Array.from(new Set([...(primary.conversationIds ?? []), ...(dup.conversationIds ?? [])]));
+
+  const now = FieldValue.serverTimestamp();
+  const batch = db.batch();
+
+  batch.update(primaryRef, {
+    channels: mergedChannels,
+    activeOpportunityIds: mergedOppIds,
+    appointmentIds: mergedApptIds,
+    conversationIds: mergedConvoIds,
+    possibleDuplicateOf: null,
+    identityConfidence: "confirmed",
+    updatedAt: now,
+  });
+  batch.update(dupRef, { deletedAt: now, mergedInto: primaryCustomerId, updatedAt: now });
+
+  // Re-point dependent records to the surviving customer.
+  const [opps, appts, convos] = await Promise.all([
+    db.collection("opportunities").where("customerId", "==", duplicateCustomerId).get(),
+    db.collection("appointments").where("customerId", "==", duplicateCustomerId).get(),
+    db.collection("conversations").where("customerId", "==", duplicateCustomerId).get(),
+  ]);
+  opps.docs.forEach((d) => batch.update(d.ref, { customerId: primaryCustomerId }));
+  appts.docs.forEach((d) => batch.update(d.ref, { customerId: primaryCustomerId }));
+  convos.docs.forEach((d) => batch.update(d.ref, { customerId: primaryCustomerId }));
+
+  await batch.commit();
+
+  await primaryRef.collection("timeline").add({
+    type: "owner_took_over",
+    actor: "you",
+    headline: "Merged duplicate customer record",
+    detail: null,
+    occurredAt: now,
+    relatedOpportunityId: null,
+  });
+
+  return { ok: true as const };
+});
+
+// ---------------------------------------------------------------------------
+// Edit customer identity (spec §34) — name, phone, preferred channel only.
+// ---------------------------------------------------------------------------
+export const editCustomerIdentity = onCall(async (request) => {
+  const { customerId, updates } = request.data as {
+    customerId: string;
+    updates: { displayName?: string; phone?: string; preferredChannel?: "whatsapp" | "phone" | "web" };
+  };
+  const { customerRef } = await requireOwnedCustomer(request, customerId);
+
+  const allowed: Record<string, unknown> = {};
+  if (typeof updates?.displayName === "string") {
+    const trimmed = updates.displayName.trim();
+    if (trimmed.length > 120) throw new HttpsError("invalid-argument", "Name is too long.");
+    allowed.displayName = trimmed || null;
+  }
+  if (typeof updates?.phone === "string") {
+    const trimmed = updates.phone.trim();
+    if (trimmed && !/^[+\d][\d\s()-]{4,20}$/.test(trimmed)) {
+      throw new HttpsError("invalid-argument", "Phone number doesn't look valid.");
+    }
+    allowed.phone = trimmed || null;
+  }
+  if (updates?.preferredChannel) {
+    if (!["whatsapp", "phone", "web"].includes(updates.preferredChannel)) {
+      throw new HttpsError("invalid-argument", "Unknown channel.");
+    }
+    allowed.preferredChannel = updates.preferredChannel;
+  }
+
+  if (Object.keys(allowed).length === 0) {
+    throw new HttpsError("invalid-argument", "No valid fields to update.");
+  }
+
+  allowed.updatedAt = FieldValue.serverTimestamp();
+  await customerRef.update(allowed);
+
+  return { ok: true as const };
+});
+
+// ---------------------------------------------------------------------------
+// Take over conversation (spec §37, §44) — pauses autonomous messaging.
+// No confirmation needed: reversible, time-sensitive (spec §73).
+// ---------------------------------------------------------------------------
+export const takeOverConversation = onCall(async (request) => {
+  const { customerId, opportunityId } = request.data as { customerId: string; opportunityId?: string };
+  const { customerRef } = await requireOwnedCustomer(request, customerId);
+
+  const now = FieldValue.serverTimestamp();
+  await customerRef.update({ currentState: "active", updatedAt: now });
+
+  if (opportunityId) {
+    await db.collection("opportunities").doc(opportunityId).update({
+      recoveryState: "stopped",
+      lastActivityAt: now,
+    });
+  }
+
+  await customerRef.collection("timeline").add({
+    type: "owner_took_over",
+    actor: "you",
+    headline: "Took over the conversation",
+    detail: "Autonomous customer messaging paused until resumed.",
+    occurredAt: now,
+    relatedOpportunityId: opportunityId ?? null,
+  });
+
+  return { ok: true as const };
+});
+
+// ---------------------------------------------------------------------------
+// Resume automatic recovery / "Let Isolynic help again" (spec §44)
+// ---------------------------------------------------------------------------
+export const resumeAutomaticRecovery = onCall(async (request) => {
+  const { customerId, opportunityId } = request.data as { customerId: string; opportunityId: string };
+  const { customerRef } = await requireOwnedCustomer(request, customerId);
+
+  if (!opportunityId) throw new HttpsError("invalid-argument", "opportunityId is required.");
+
+  const now = FieldValue.serverTimestamp();
+  await db.collection("opportunities").doc(opportunityId).update({
+    recoveryState: "in_progress",
+    recoveryLastMessageAt: now,
+    lastActivityAt: now,
+  });
+  await customerRef.update({ currentState: "waiting", updatedAt: now });
+
+  await customerRef.collection("timeline").add({
+    type: "recovery_started",
+    actor: "isolynic",
+    headline: "Recovery started",
+    detail: null,
+    occurredAt: now,
+    relatedOpportunityId: opportunityId,
+  });
+
+  return { ok: true as const };
+});
+
+// ---------------------------------------------------------------------------
+// Stop recovery (spec §42) — owner can halt an in-progress recovery attempt.
+// ---------------------------------------------------------------------------
+export const stopRecovery = onCall(async (request) => {
+  const { customerId, opportunityId } = request.data as { customerId: string; opportunityId: string };
+  const { customerRef } = await requireOwnedCustomer(request, customerId);
+
+  if (!opportunityId) throw new HttpsError("invalid-argument", "opportunityId is required.");
+
+  const now = FieldValue.serverTimestamp();
+  await db.collection("opportunities").doc(opportunityId).update({
+    recoveryState: "stopped",
+    lastActivityAt: now,
+  });
+  await customerRef.update({ currentState: "active", updatedAt: now });
+
+  await customerRef.collection("timeline").add({
+    type: "owner_took_over",
+    actor: "you",
+    headline: "Stopped automatic recovery",
+    detail: null,
+    occurredAt: now,
+    relatedOpportunityId: opportunityId,
+  });
+
+  return { ok: true as const };
+});
+
+// ---------------------------------------------------------------------------
+// Block / unblock automatic messages (spec §69) — confirmation required.
+// ---------------------------------------------------------------------------
+export const setAutoRecoveryBlocked = onCall(async (request) => {
+  const { customerId, blocked } = request.data as { customerId: string; blocked: boolean };
+  const { customerRef } = await requireOwnedCustomer(request, customerId);
+
+  await customerRef.update({ autoRecoveryBlocked: Boolean(blocked), updatedAt: FieldValue.serverTimestamp() });
+
+  await customerRef.collection("timeline").add({
+    type: "owner_took_over",
+    actor: "you",
+    headline: blocked ? "Turned off automatic messages" : "Turned on automatic messages",
+    detail: null,
+    occurredAt: FieldValue.serverTimestamp(),
+    relatedOpportunityId: null,
+  });
+
+  return { ok: true as const };
+});
+
+// ---------------------------------------------------------------------------
+// Confirm or ignore a smart suggestion (spec §29)
+// ---------------------------------------------------------------------------
+export const confirmSmartSuggestion = onCall(async (request) => {
+  const { customerId, suggestionId, accept } = request.data as {
+    customerId: string;
+    suggestionId: string;
+    accept: boolean;
+  };
+  const { customerRef } = await requireOwnedCustomer(request, customerId);
+
+  const suggestionRef = customerRef.collection("smartSuggestions").doc(suggestionId);
+  const suggestionSnap = await suggestionRef.get();
+  if (!suggestionSnap.exists) {
+    throw new HttpsError("not-found", "Suggestion not found.");
+  }
+  const suggestion = suggestionSnap.data()!;
+
+  if (!accept) {
+    await suggestionRef.update({ status: "ignored" });
+    return { ok: true as const };
+  }
+
+  const now = FieldValue.serverTimestamp();
+  const batch = db.batch();
+  batch.update(suggestionRef, { status: "saved" });
+
+  if (suggestion.kind === "note") {
+    const noteRef = customerRef.collection("notes").doc();
+    batch.set(noteRef, { text: suggestion.proposedValue, createdBy: "owner", createdAt: now });
+  } else if (suggestion.kind === "preferred_channel") {
+    batch.update(customerRef, { preferredChannel: suggestion.proposedValue, updatedAt: now });
+  } else if (suggestion.kind === "preferred_time") {
+    batch.update(customerRef, { "preferences.communicationTime": suggestion.proposedValue, updatedAt: now });
+  }
+
+  await batch.commit();
+  return { ok: true as const };
+});
+
+// ---------------------------------------------------------------------------
+// Send a message (spec §12, §74) — owner-authored, always an explicit send.
+// Queues onto the appropriate channel; delivery is handled by an existing
+// messaging integration (WhatsApp/etc.) outside this function's scope.
+// ---------------------------------------------------------------------------
+export const sendCustomerMessage = onCall(async (request) => {
+  const { customerId, opportunityId, text } = request.data as {
+    customerId: string;
+    opportunityId: string | null;
+    text: string;
+  };
+  const { customerRef, customerSnap } = await requireOwnedCustomer(request, customerId);
+
+  const trimmed = (text ?? "").trim();
+  if (!trimmed) throw new HttpsError("invalid-argument", "Message text is required.");
+  if (trimmed.length > 4000) throw new HttpsError("invalid-argument", "Message is too long.");
+
+  const customer = customerSnap.data()!;
+  const channel: "whatsapp" | "phone" | "web" | null = customer.channels?.whatsapp
+    ? "whatsapp"
+    : customer.channels?.phone
+    ? "phone"
+    : null;
+  if (!channel) {
+    throw new HttpsError("failed-precondition", "We don't have a messaging channel for this customer yet.");
+  }
+
+  const now = FieldValue.serverTimestamp();
+  const outboundRef = db.collection("outboundMessages").doc();
+  await outboundRef.set({
+    customerId,
+    opportunityId: opportunityId ?? null,
+    channel,
+    text: trimmed,
+    author: "you",
+    status: "queued",
+    createdAt: now,
+  });
+
+  await customerRef.update({ lastContactedAt: now, updatedAt: now });
+
+  return { ok: true as const, queued: true as const };
+});
+```
+
+### `functions/src/customer/timelineTrigger.ts`
+
+```typescript
+// functions/src/customer/timelineTrigger.ts
+import { onDocumentUpdated, onDocumentCreated } from "firebase-functions/v2/firestore";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+
+const db = getFirestore();
+
+/** Translates opportunity state transitions into the plain-language
+ * timeline events described in spec §21–23. Runs server-side so the
+ * client never has to (and never could accidentally) fabricate history. */
+export const onOpportunityWriteBuildTimeline = onDocumentUpdated(
+  "opportunities/{opportunityId}",
+  async (event) => {
+    const before = event.data?.before.data();
+    const after = event.data?.after.data();
+    if (!before || !after) return;
+    if (before.state === after.state && before.recoveryState === after.recoveryState) return;
+
+    const customerRef = db.collection("customers").doc(after.customerId);
+    const timelineRef = customerRef.collection("timeline");
+    const now = FieldValue.serverTimestamp();
+
+    if (before.recoveryState !== "in_progress" && after.recoveryState === "in_progress") {
+      await timelineRef.add({
+        type: "recovery_started",
+        actor: "isolynic",
+        headline: "Recovery started",
+        detail: null,
+        occurredAt: now,
+        relatedOpportunityId: after.id ?? event.params.opportunityId,
+      });
+    }
+
+    if (after.state === "booked" && before.state !== "booked") {
+      await Promise.all([
+        timelineRef.add({
+          type: after.recoveryState === "in_progress" ? "recovery_succeeded" : "appointment_created",
+          actor: after.recoveryState === "in_progress" ? "isolynic" : "customer",
+          headline: after.recoveryState === "in_progress" ? "Customer returned and booked" : "Appointment booked",
+          detail: null,
+          occurredAt: now,
+          relatedOpportunityId: event.params.opportunityId,
+        }),
+        customerRef.update({
+          currentState: after.recoveryState === "in_progress" ? "recovered" : "booked",
+          updatedAt: now,
+        }),
+      ]);
+    }
+
+    if (after.state === "lost" && before.state !== "lost") {
+      await Promise.all([
+        timelineRef.add({
+          type: "opportunity_lost",
+          actor: "system",
+          headline: "Opportunity marked lost",
+          detail: null,
+          occurredAt: now,
+          relatedOpportunityId: event.params.opportunityId,
+        }),
+        customerRef.update({ currentState: "lost", updatedAt: now }),
+      ]);
+    }
+
+    if (after.state === "completed" && before.state !== "completed") {
+      await Promise.all([
+        timelineRef.add({
+          type: "appointment_completed",
+          actor: "system",
+          headline: "Request completed",
+          detail: null,
+          occurredAt: now,
+          relatedOpportunityId: event.params.opportunityId,
+        }),
+        customerRef.update({ currentState: "completed", updatedAt: now }),
+      ]);
+    }
+  }
+);
+
+/** New appointment => timeline entry + link on the customer doc. */
+export const onAppointmentCreatedBuildTimeline = onDocumentCreated(
+  "appointments/{appointmentId}",
+  async (event) => {
+    const appt = event.data?.data();
+    if (!appt) return;
+
+    const customerRef = db.collection("customers").doc(appt.customerId);
+    const now = FieldValue.serverTimestamp();
+
+    await Promise.all([
+      customerRef.collection("timeline").add({
+        type: "appointment_created",
+        actor: "system",
+        headline: "Appointment created",
+        detail: appt.title ?? null,
+        occurredAt: now,
+        relatedOpportunityId: appt.opportunityId ?? null,
+      }),
+      customerRef.update({
+        appointmentIds: FieldValue.arrayUnion(event.params.appointmentId),
+        updatedAt: now,
+      }),
+    ]);
+  }
+);
+
+/** Appointment status/time change => timeline entry (spec §22). */
+export const onAppointmentUpdatedBuildTimeline = onDocumentUpdated(
+  "appointments/{appointmentId}",
+  async (event) => {
+    const before = event.data?.before.data();
+    const after = event.data?.after.data();
+    if (!before || !after) return;
+    if (before.status === after.status && before.startsAt?.isEqual?.(after.startsAt)) return;
+
+    const customerRef = db.collection("customers").doc(after.customerId);
+    const now = FieldValue.serverTimestamp();
+
+    const headline =
+      after.status === "cancelled"
+        ? "Appointment cancelled"
+        : after.status === "completed"
+        ? "Appointment completed"
+        : "Appointment changed";
+
+    await customerRef.collection("timeline").add({
+      type: after.status === "completed" ? "appointment_completed" : "appointment_changed",
+      actor: "system",
+      headline,
+      detail: null,
+      occurredAt: now,
+      relatedOpportunityId: after.opportunityId ?? null,
+    });
+  }
+);
+
+/** Inbound/outbound message => lightweight "contacted" timeline entry.
+ * Keeps the full thread on Screen 5 while giving Screen 6 a memory trail. */
+export const onMessageCreatedBuildTimeline = onDocumentCreated(
+  "conversations/{conversationId}/messages/{messageId}",
+  async (event) => {
+    const message = event.data?.data();
+    if (!message) return;
+
+    const conversationSnap = await db.collection("conversations").doc(event.params.conversationId).get();
+    if (!conversationSnap.exists) return;
+    const customerId = conversationSnap.data()!.customerId as string;
+    const customerRef = db.collection("customers").doc(customerId);
+    const now = FieldValue.serverTimestamp();
+
+    const type =
+      message.author === "customer" ? "customer_contacted" : message.author === "isolynic" ? "isolynic_contacted" : "owner_contacted";
+    const headline =
+      message.author === "customer" ? "Customer sent a message" : message.author === "isolynic" ? "Isolynic followed up" : "You sent a message";
+
+    await Promise.all([
+      customerRef.collection("timeline").add({
+        type,
+        actor: message.author,
+        headline,
+        detail: null,
+        occurredAt: now,
+        relatedOpportunityId: null,
+      }),
+      customerRef.update({
+        lastContactedAt: now,
+        updatedAt: now,
+        ...(message.author === "customer" ? { currentState: "needs_attention" } : {}),
+      }),
+    ]);
+  }
+);
+```
+
+### `functions/src/index.ts`
+
+```typescript
+// functions/src/index.ts
+import { initializeApp, getApps } from "firebase-admin/app";
+
+if (!getApps().length) {
+  initializeApp();
+}
+
+export {
+  markCustomerNotACustomer,
+  deleteCustomer,
+  mergeCustomers,
+  editCustomerIdentity,
+  takeOverConversation,
+  resumeAutomaticRecovery,
+  stopRecovery,
+  setAutoRecoveryBlocked,
+  confirmSmartSuggestion,
+  sendCustomerMessage,
+} from "./customer/mutations";
+
+export {
+  onOpportunityWriteBuildTimeline,
+  onAppointmentCreatedBuildTimeline,
+  onAppointmentUpdatedBuildTimeline,
+  onMessageCreatedBuildTimeline,
+} from "./customer/timelineTrigger";
+```
+
+### Firestore security rules — customer-scoped excerpt
+
+```
+// firestore.rules (excerpt — merge into the existing ruleset)
+match /customers/{customerId} {
+  allow read: if isBusinessMember(resource.data.businessId);
+  allow write: if false; // all mutations go through Cloud Functions
+
+  match /notes/{noteId} {
+    allow read: if isBusinessMember(get(/databases/$(database)/documents/customers/$(customerId)).data.businessId);
+    allow create: if isBusinessMember(get(/databases/$(database)/documents/customers/$(customerId)).data.businessId)
+                  && request.resource.data.text is string
+                  && request.resource.data.text.size() <= 1000
+                  && request.resource.data.createdBy == "owner";
+    allow update, delete: if false;
+  }
+
+  match /timeline/{eventId} {
+    allow read: if isBusinessMember(get(/databases/$(database)/documents/customers/$(customerId)).data.businessId);
+    allow write: if false; // written only by Cloud Functions triggers
+  }
+
+  match /smartSuggestions/{suggestionId} {
+    allow read: if isBusinessMember(get(/databases/$(database)/documents/customers/$(customerId)).data.businessId);
+    allow write: if false; // written only server-side; updated via confirmSmartSuggestion
+  }
+}
+```
+
+---
+
+This gives you: real-time, offline-aware data loading with per-section skeletons (§54–56); every named current-situation, empty, and error state (§16, §39–44, §71–72); the mobile/tablet/desktop composition exactly as laid out (§46–50, §79–80); confirmation-gated destructive actions (§73); natural-language-only AI/timeline output with no exposed scores (§17, §23, §97); and a Cloud Functions layer that keeps identity merging, deletion, and autonomous-messaging control server-authoritative rather than trusting the client.

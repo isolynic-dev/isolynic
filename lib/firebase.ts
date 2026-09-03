@@ -10,6 +10,14 @@ import {
 } from "firebase/auth";
 import { getFirestore, type Firestore } from "firebase/firestore";
 import { getAnalytics, isSupported, type Analytics } from "firebase/analytics";
+import {
+  getFirestore,
+  enableIndexedDbPersistence,
+  type Firestore,
+} from "firebase/firestore";
+import { getAuth, type Auth } from "firebase/auth";
+
+
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -62,4 +70,43 @@ export async function getFirebaseAnalytics(): Promise<Analytics | null> {
   } catch {
     return null;
   }
+}
+
+
+
+
+
+
+
+
+
+const firebaseConfig = {
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
+};
+
+function getFirebaseApp(): FirebaseApp {
+  return getApps().length ? getApp() : initializeApp(firebaseConfig);
+}
+
+export const app = getFirebaseApp();
+export const db: Firestore = getFirestore(app);
+export const auth: Auth = getAuth(app);
+
+// Offline cache — required by spec §52 ("show last known valid state offline").
+// Guarded for SSR since IndexedDB only exists in the browser, and guarded
+// against multi-tab failures which are non-fatal.
+if (typeof window !== "undefined") {
+  enableIndexedDbPersistence(db).catch((err) => {
+    if (err.code === "failed-precondition") {
+      // Multiple tabs open — persistence can only be enabled in one at a time.
+      console.warn("Firestore persistence unavailable: multiple tabs open.");
+    } else if (err.code === "unimplemented") {
+      console.warn("Firestore persistence unavailable in this browser.");
+    }
+  });
 }

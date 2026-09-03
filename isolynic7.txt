@@ -1,0 +1,1459 @@
+Here's the complete production-grade implementation for Screen 7 (Results), following the blueprint precisely.
+
+---
+
+## 1. Shared Types — `types/results.ts`
+
+```typescript
+// types/results.ts
+
+export type ResultOutcome =
+  | 'ACTIVE'
+  | 'AT_RISK'
+  | 'RECOVERED'
+  | 'BOOKED'
+  | 'LOST'
+  | 'DECLINED'
+  | 'OWNER_HANDLED';
+
+export type AttributionStatus =
+  | 'ATTRIBUTED'
+  | 'PROBABLE'
+  | 'UNCONFIRMED'
+  | 'NOT_ATTRIBUTED';
+
+export type SourceChannel = 'sms' | 'call' | 'email' | 'chat' | 'web_form' | 'other';
+
+export interface OpportunityResult {
+  opportunity_id: string;
+  business_id: string;
+  customer_id: string;
+  customer_name: string; // display name only, no PII beyond first name/initial per privacy rules
+  detected_at: number; // epoch ms
+  risk_started_at: number | null;
+  recovery_action_at: number | null;
+  reengaged_at: number | null;
+  booking_at: number | null;
+  outcome: ResultOutcome;
+  estimated_value: number | null;
+  attribution_status: AttributionStatus;
+  source_channel: SourceChannel;
+  manual_override?: 'RECOVERED' | 'NOT_RECOVERED' | null;
+  summary_stage_label?: string; // e.g. "Missed call"
+  summary_intervention_label?: string; // e.g. "followed up"
+  summary_outcome_label?: string; // e.g. "booked appointment"
+  updated_at: number;
+}
+
+export type ResultsPeriod = 7 | 30 | 90;
+
+export interface ResultsHeadline {
+  business_id: string;
+  period_days: ResultsPeriod;
+  period_start: number;
+  period_end: number;
+  opportunities_recovered: number;
+  customers_reactivated: number;
+  bookings_recovered: number;
+  opportunities_still_at_risk: number;
+  opportunities_lost: number;
+  estimated_revenue_recovered: number | null;
+  estimated_revenue_basis: 'CUSTOMER_PROVIDED' | 'VERIFIED' | 'MIXED' | 'NONE';
+  previous_period_opportunities_recovered: number | null;
+  previous_period_has_enough_data: boolean;
+  computed_at: number;
+  data_freshness_note?: string;
+  is_partial: boolean;
+}
+
+export interface RecoveryTrendPoint {
+  label: string; // "W1", "W2" or date label
+  recovered_count: number;
+  period_start: number;
+  period_end: number;
+}
+
+export interface RecoveryEvidenceItem {
+  opportunity_id: string;
+  customer_first_name: string;
+  stage_label: string;
+  intervention_label: string;
+  outcome_label: string;
+  occurred_at: number;
+}
+
+export interface ResultsBundle {
+  headline: ResultsHeadline;
+  trend: RecoveryTrendPoint[];
+  evidence: RecoveryEvidenceItem[];
+}
+
+export interface BusinessSettings {
+  business_id: string;
+  typical_customer_value: number | null;
+  typical_booking_value: number | null;
+  currency: string; // ISO 4217, e.g. "USD", "GHS", "EUR"
+  locale: string; // e.g. "en-US", "en-GH"
+  plan: string;
+  plan_opportunity_limit?: number | null;
+}
+```
+
+---
+
+## 2. Firestore Data Layer / Hooks — `lib/results/useResults.ts`
+
+```typescript
+// lib/results/useResults.ts
+'use client';
+
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { getFunctions, httpsCallable } from 'firebase/functions';
+import { doc, onSnapshot } from 'firebase/firestore';
+import { db, app } from '@/lib/firebase/client';
+import type { ResultsBundle, ResultsPeriod, BusinessSettings } from '@/types/results';
+
+interface UseResultsState {
+  data: ResultsBundle | null;
+  settings: BusinessSettings | null;
+  loading: boolean;
+  error: string | null;
+  isPartial: boolean;
+  refresh: () => void;
+  lastRefreshedAt: number | null;
+}
+
+// Results are precomputed server-side by a Cloud Function into
+// /businesses/{businessId}/resultsCache/{period}
+// This keeps the client cheap and avoids recomputing aggregation on every load.
+export function useResults(businessId: string | null, period: ResultsPeriod): UseResultsState {
+  const [data, setData] = useState<ResultsBundle | null>(null);
+  const [settings, setSettings] = useState<BusinessSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<number | null>(null);
+  const [refreshToken, setRefreshToken] = useState(0);
+
+  const isPartial = useMemo(() => !!data?.headline?.is_partial, [data]);
+
+  useEffect(() => {
+    if (!businessId) return;
+    setLoading(true);
+    setError(null);
+
+    const cacheRef = doc(db, 'businesses', businessId, 'resultsCache', String(period));
+
+    const unsubscribe = onSnapshot(
+      cacheRef,
+      (snap) => {
+        if (!snap.exists()) {
+          // No cache yet — trigger a compute via callable, then wait for snapshot update.
+          triggerCompute(businessId, period).catch((e) => {
+            setError(e?.message ?? 'We couldn\'t load your results.');
+          });
+          setLoading(false);
+          setData(null);
+          return;
+        }
+        const bundle = snap.data() as ResultsBundle;
+        setData(bundle);
+        setLastRefreshedAt(bundle.headline?.computed_at ?? Date.now());
+        setLoading(false);
+      },
+      (err) => {
+        setError(err?.message ?? 'We couldn\'t load your results.');
+        setLoading(false);
+      }
+    );
+
+    const settingsRef = doc(db, 'businesses', businessId);
+    const unsubSettings = onSnapshot(settingsRef, (snap) => {
+      if (snap.exists()) {
+        setSettings(snap.data() as BusinessSettings);
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      unsubSettings();
+    };
+  }, [businessId, period, refreshToken]);
+
+  const refresh = useCallback(() => {
+    if (!businessId) return;
+    setLoading(true);
+    triggerCompute(businessId, period, true)
+      .then(() => setRefreshToken((t) => t + 1))
+      .catch((e) => setError(e?.message ?? 'We couldn\'t refresh your results.'))
+      .finally(() => setLoading(false));
+  }, [businessId, period]);
+
+  return { data, settings, loading, error, isPartial, refresh, lastRefreshedAt };
+}
+
+async function triggerCompute(businessId: string, period: ResultsPeriod, force = false) {
+  const functions = getFunctions(app);
+  const computeResults = httpsCallable(functions, 'computeResultsForBusiness');
+  await computeResults({ businessId, period, force });
+}
+```
+
+---
+
+## 3. Manual Correction Hook — `lib/results/useManualCorrection.ts`
+
+```typescript
+// lib/results/useManualCorrection.ts
+'use client';
+
+import { getFunctions, httpsCallable } from 'firebase/functions';
+import { app } from '@/lib/firebase/client';
+
+export async function submitManualCorrection(
+  businessId: string,
+  opportunityId: string,
+  wasRecovered: boolean
+) {
+  const functions = getFunctions(app);
+  const correct = httpsCallable(functions, 'submitResultCorrection');
+  await correct({ businessId, opportunityId, wasRecovered });
+}
+```
+
+---
+
+## 4. Formatting Utilities — `lib/results/format.ts`
+
+```typescript
+// lib/results/format.ts
+
+export function formatCurrency(amount: number, currency: string, locale: string): string {
+  try {
+    return new Intl.NumberFormat(locale || 'en-US', {
+      style: 'currency',
+      currency: currency || 'USD',
+      maximumFractionDigits: 0,
+    }).format(amount);
+  } catch {
+    return `${currency} ${amount.toLocaleString()}`;
+  }
+}
+
+export function formatComparisonSentence(
+  current: number,
+  previous: number | null,
+  hasEnoughData: boolean,
+  noun = 'opportunities recovered'
+): string | null {
+  if (!hasEnoughData || previous === null) return null;
+  const diff = current - previous;
+  if (diff === 0) return `Same number of ${noun} as the previous period.`;
+  const direction = diff > 0 ? 'more' : 'fewer';
+  return `${Math.abs(diff)} ${direction} ${noun} than the previous period.`;
+}
+
+export function formatRelativeFreshness(computedAt: number | null): string {
+  if (!computedAt) return '';
+  const diffMs = Date.now() - computedAt;
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return 'Updated just now';
+  if (diffMin === 1) return 'Updated 1 minute ago';
+  if (diffMin < 60) return `Updated ${diffMin} minutes ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `Updated ${diffHr} hour${diffHr > 1 ? 's' : ''} ago`;
+  return 'Updated recently';
+}
+```
+
+---
+
+## 5. Components
+
+### `components/results/TimePeriodSelector.tsx`
+
+```tsx
+'use client';
+
+import { ResultsPeriod } from '@/types/results';
+
+const OPTIONS: { value: ResultsPeriod; label: string }[] = [
+  { value: 7, label: '7 days' },
+  { value: 30, label: '30 days' },
+  { value: 90, label: '90 days' },
+];
+
+interface Props {
+  value: ResultsPeriod;
+  onChange: (period: ResultsPeriod) => void;
+  disabled?: boolean;
+}
+
+export function TimePeriodSelector({ value, onChange, disabled }: Props) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Results time period"
+      className="inline-flex items-center gap-1 rounded-full bg-neutral-100 p-1"
+    >
+      {OPTIONS.map((opt) => {
+        const selected = opt.value === value;
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            role="radio"
+            aria-checked={selected}
+            disabled={disabled}
+            onClick={() => onChange(opt.value)}
+            className={[
+              'px-3 py-1.5 text-sm font-medium rounded-full transition-colors duration-200',
+              'focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-neutral-900',
+              selected
+                ? 'bg-white text-neutral-900 shadow-sm'
+                : 'text-neutral-500 hover:text-neutral-800',
+              disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer',
+            ].join(' ')}
+          >
+            {opt.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+```
+
+### `components/results/HeroMetric.tsx`
+
+```tsx
+'use client';
+
+import { formatCurrency, formatComparisonSentence } from '@/lib/results/format';
+import type { ResultsHeadline } from '@/types/results';
+
+interface Props {
+  headline: ResultsHeadline;
+  currency: string;
+  locale: string;
+  hasTypicalValue: boolean;
+  onDrillOpportunitiesRecovered: () => void;
+  onDrillBookings: () => void;
+  onOpenRevenueExplainer: () => void;
+  onAddCustomerValue: () => void;
+}
+
+export function HeroMetric({
+  headline,
+  currency,
+  locale,
+  hasTypicalValue,
+  onDrillOpportunitiesRecovered,
+  onDrillBookings,
+  onOpenRevenueExplainer,
+  onAddCustomerValue,
+}: Props) {
+  const comparison = formatComparisonSentence(
+    headline.opportunities_recovered,
+    headline.previous_period_opportunities_recovered,
+    headline.previous_period_has_enough_data
+  );
+
+  return (
+    <section aria-labelledby="hero-metric-heading" className="w-full">
+      <button
+        type="button"
+        onClick={onDrillOpportunitiesRecovered}
+        className="w-full text-left group focus:outline-none"
+      >
+        <span
+          id="hero-metric-heading"
+          className="block text-5xl sm:text-6xl font-semibold tracking-tight text-neutral-900 tabular-nums transition-transform duration-300 group-hover:scale-[1.01]"
+        >
+          {headline.opportunities_recovered.toLocaleString(locale)}
+        </span>
+        <span className="block mt-1 text-base sm:text-lg font-medium text-neutral-700">
+          Opportunities recovered
+        </span>
+        <span className="block mt-1 text-sm text-neutral-500 max-w-md">
+          Customers who may have been lost but came back after Isolynic stepped in.
+        </span>
+        {comparison && (
+          <span className="block mt-2 text-xs text-neutral-400">{comparison}</span>
+        )}
+      </button>
+
+      <div className="mt-5 flex flex-wrap items-center gap-x-6 gap-y-3">
+        <button
+          type="button"
+          onClick={onDrillBookings}
+          className="flex items-baseline gap-1.5 text-sm text-neutral-700 hover:text-neutral-900 focus:outline-none focus-visible:underline"
+        >
+          <span className="font-semibold tabular-nums">{headline.bookings_recovered}</span>
+          <span>became bookings</span>
+        </button>
+
+        {headline.estimated_revenue_recovered !== null ? (
+          <button
+            type="button"
+            onClick={onOpenRevenueExplainer}
+            className="flex items-baseline gap-1.5 text-sm text-neutral-700 hover:text-neutral-900 focus:outline-none focus-visible:underline"
+          >
+            <span className="font-semibold tabular-nums">
+              {formatCurrency(headline.estimated_revenue_recovered, currency, locale)}
+            </span>
+            <span>estimated value</span>
+          </button>
+        ) : !hasTypicalValue ? (
+          <button
+            type="button"
+            onClick={onAddCustomerValue}
+            className="text-sm text-blue-600 hover:text-blue-700 underline focus:outline-none"
+          >
+            Add your typical customer value to estimate recovered revenue
+          </button>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+```
+
+### `components/results/RevenueEstimateDisclaimer.tsx`
+
+```tsx
+'use client';
+
+import { useState } from 'react';
+
+export function RevenueEstimateNote() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-1">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="text-xs text-neutral-400 underline decoration-dotted focus:outline-none"
+      >
+        Based on the customer value you've provided and the opportunities Isolynic helped recover.
+      </button>
+      {open && (
+        <p className="mt-2 text-xs text-neutral-500 max-w-md bg-neutral-50 rounded-md p-3">
+          This is an estimate, not an accounting figure. Isolynic only knows the revenue
+          information you provide.
+        </p>
+      )}
+    </div>
+  );
+}
+```
+
+### `components/results/SecondaryMetricsGrid.tsx`
+
+```tsx
+'use client';
+
+import type { ResultsHeadline } from '@/types/results';
+
+interface CardDef {
+  key: string;
+  value: number;
+  label: string;
+  tone: 'positive' | 'warning' | 'neutral';
+  onClick?: () => void;
+}
+
+interface Props {
+  headline: ResultsHeadline;
+  onDrillReactivated: () => void;
+  onDrillAtRisk: () => void;
+  onDrillLost: () => void;
+}
+
+const toneClasses: Record<CardDef['tone'], string> = {
+  positive: 'border-emerald-100 bg-emerald-50/50',
+  warning: 'border-amber-100 bg-amber-50/50',
+  neutral: 'border-neutral-200 bg-neutral-50',
+};
+
+export function SecondaryMetricsGrid({
+  headline,
+  onDrillReactivated,
+  onDrillAtRisk,
+  onDrillLost,
+}: Props) {
+  const cards: CardDef[] = [
+    {
+      key: 'reactivated',
+      value: headline.customers_reactivated,
+      label: 'Customers reactivated',
+      tone: 'positive',
+      onClick: onDrillReactivated,
+    },
+    {
+      key: 'at_risk',
+      value: headline.opportunities_still_at_risk,
+      label: 'Still at risk',
+      tone: 'warning',
+      onClick: onDrillAtRisk,
+    },
+    {
+      key: 'lost',
+      value: headline.opportunities_lost,
+      label: 'Opportunities lost',
+      tone: 'neutral',
+      onClick: onDrillLost,
+    },
+  ];
+
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3" role="list">
+      {cards.map((c) => (
+        <button
+          key={c.key}
+          type="button"
+          role="listitem"
+          onClick={c.onClick}
+          className={[
+            'text-left rounded-xl border p-4 transition-colors duration-200',
+            'focus:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900',
+            toneClasses[c.tone],
+          ].join(' ')}
+        >
+          <span className="block text-2xl font-semibold tabular-nums text-neutral-900">
+            {c.value.toLocaleString()}
+          </span>
+          <span className="block mt-0.5 text-sm text-neutral-600">{c.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+```
+
+### `components/results/RecoveryEvidenceList.tsx`
+
+```tsx
+'use client';
+
+import type { RecoveryEvidenceItem } from '@/types/results';
+
+interface Props {
+  items: RecoveryEvidenceItem[];
+  onSelect: (opportunityId: string) => void;
+}
+
+export function RecoveryEvidenceList({ items, onSelect }: Props) {
+  if (items.length === 0) return null;
+
+  return (
+    <section aria-labelledby="recovery-evidence-heading" className="w-full">
+      <h2 id="recovery-evidence-heading" className="text-sm font-semibold text-neutral-800 mb-3">
+        Where the recovery happened
+      </h2>
+      <ul className="divide-y divide-neutral-100 rounded-xl border border-neutral-200 overflow-hidden">
+        {items.map((item) => (
+          <li key={item.opportunity_id}>
+            <button
+              type="button"
+              onClick={() => onSelect(item.opportunity_id)}
+              className="w-full text-left px-4 py-3 hover:bg-neutral-50 focus:outline-none focus-visible:bg-neutral-50 transition-colors"
+            >
+              <span className="block text-sm font-medium text-neutral-900">
+                {item.customer_first_name}
+              </span>
+              <span className="block text-xs text-neutral-500 mt-0.5">
+                {item.stage_label} → {item.intervention_label} → {item.outcome_label}
+              </span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+```
+
+### `components/results/RecoveryTrend.tsx`
+
+```tsx
+'use client';
+
+import type { RecoveryTrendPoint } from '@/types/results';
+
+interface Props {
+  points: RecoveryTrendPoint[];
+  isMobile: boolean;
+}
+
+export function RecoveryTrend({ points, isMobile }: Props) {
+  if (points.length === 0) return null;
+  const max = Math.max(...points.map((p) => p.recovered_count), 1);
+
+  if (isMobile) {
+    // Concise vertical list per spec section 20 — preferable to a miniature graph.
+    return (
+      <section aria-labelledby="trend-heading-mobile">
+        <h2 id="trend-heading-mobile" className="text-sm font-semibold text-neutral-800 mb-3">
+          Recovery this period
+        </h2>
+        <ul className="space-y-1.5">
+          {points.map((p) => (
+            <li
+              key={p.label}
+              className="flex items-center justify-between text-sm text-neutral-700 py-1"
+            >
+              <span>{p.label}</span>
+              <span className="font-medium tabular-nums">{p.recovered_count}</span>
+            </li>
+          ))}
+        </ul>
+      </section>
+    );
+  }
+
+  return (
+    <section aria-labelledby="trend-heading">
+      <h2 id="trend-heading" className="text-sm font-semibold text-neutral-800 mb-3">
+        Recovery over time
+      </h2>
+      <div
+        role="img"
+        aria-label={`Recovered opportunities by period: ${points
+          .map((p) => `${p.label}: ${p.recovered_count}`)
+          .join(', ')}`}
+        className="flex items-end gap-2 h-32"
+      >
+        {points.map((p) => (
+          <div key={p.label} className="flex-1 flex flex-col items-center gap-1.5">
+            <div
+              className="w-full rounded-t-sm bg-neutral-800 transition-all duration-500"
+              style={{ height: `${Math.max((p.recovered_count / max) * 100, p.recovered_count > 0 ? 6 : 2)}%` }}
+            />
+            <span className="text-[11px] text-neutral-400">{p.label}</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+```
+
+### `components/results/StillAtRiskBanner.tsx`
+
+```tsx
+'use client';
+
+interface Props {
+  count: number;
+  onReview: () => void;
+}
+
+export function StillAtRiskBanner({ count, onReview }: Props) {
+  if (count === 0) return null;
+  return (
+    <section className="flex items-center justify-between rounded-xl border border-amber-100 bg-amber-50/60 px-4 py-3.5">
+      <p className="text-sm text-neutral-800">
+        <span className="font-semibold tabular-nums">{count}</span>{' '}
+        customer{count === 1 ? '' : 's'} may still need attention
+      </p>
+      <button
+        type="button"
+        onClick={onReview}
+        className="text-sm font-medium text-neutral-900 underline underline-offset-2 hover:text-neutral-700 focus:outline-none"
+      >
+        Review
+      </button>
+    </section>
+  );
+}
+```
+
+### State Components — `components/results/States.tsx`
+
+```tsx
+'use client';
+
+export function ResultsSkeleton() {
+  return (
+    <div className="animate-pulse space-y-6" aria-busy="true" aria-label="Loading results">
+      <div className="h-4 w-24 bg-neutral-200 rounded" />
+      <div className="space-y-2">
+        <div className="h-14 w-32 bg-neutral-200 rounded" />
+        <div className="h-4 w-56 bg-neutral-100 rounded" />
+      </div>
+      <div className="grid grid-cols-3 gap-3">
+        <div className="h-20 bg-neutral-100 rounded-xl" />
+        <div className="h-20 bg-neutral-100 rounded-xl" />
+        <div className="h-20 bg-neutral-100 rounded-xl" />
+      </div>
+      <div className="h-32 bg-neutral-100 rounded-xl" />
+      <div className="h-24 bg-neutral-100 rounded-xl" />
+    </div>
+  );
+}
+
+export function ResultsZeroState({ onLearnMore }: { onLearnMore: () => void }) {
+  return (
+    <div className="flex flex-col items-center text-center py-16 px-4">
+      <h2 className="text-xl font-semibold text-neutral-900">Your first recovery is coming.</h2>
+      <p className="mt-2 text-sm text-neutral-500 max-w-sm">
+        When a customer goes quiet after showing interest, Isolynic will let you know what
+        happened—and help bring the right ones back.
+      </p>
+      <button
+        type="button"
+        onClick={onLearnMore}
+        className="mt-5 text-sm font-medium text-blue-600 hover:text-blue-700 underline focus:outline-none"
+      >
+        See how recovery works
+      </button>
+    </div>
+  );
+}
+
+export function ResultsEarlyUsageState() {
+  return (
+    <div className="flex flex-col items-center text-center py-16 px-4">
+      <h2 className="text-xl font-semibold text-neutral-900">
+        You're protected, but no recoveries yet.
+      </h2>
+      <p className="mt-2 text-sm text-neutral-500 max-w-sm">
+        Isolynic is watching your customer conversations. We'll show your first recovery here
+        when one happens.
+      </p>
+    </div>
+  );
+}
+
+export function ResultsErrorState({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div className="flex flex-col items-center text-center py-16 px-4" role="alert">
+      <h2 className="text-lg font-semibold text-neutral-900">We couldn't load your results.</h2>
+      <p className="mt-2 text-sm text-neutral-500 max-w-sm">
+        Your customer activity is safe. Try again in a moment.
+      </p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="mt-5 px-4 py-2 text-sm font-medium bg-neutral-900 text-white rounded-full hover:bg-neutral-800 focus:outline-none"
+      >
+        Try again
+      </button>
+    </div>
+  );
+}
+
+export function ResultsPartialBanner() {
+  return (
+    <div
+      role="status"
+      className="text-xs text-neutral-500 bg-neutral-50 border border-neutral-200 rounded-lg px-3 py-2"
+    >
+      Your results are still updating.
+    </div>
+  );
+}
+```
+
+---
+
+## 6. Main Screen — `app/results/page.tsx`
+
+```tsx
+'use client';
+
+import { useCallback, useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { useAuthedBusiness } from '@/lib/auth/useAuthedBusiness'; // existing app hook: returns { businessId, isMobile }
+import { useResults } from '@/lib/results/useResults';
+import { formatRelativeFreshness } from '@/lib/results/format';
+import type { ResultsPeriod } from '@/types/results';
+
+import { TimePeriodSelector } from '@/components/results/TimePeriodSelector';
+import { HeroMetric } from '@/components/results/HeroMetric';
+import { RevenueEstimateNote } from '@/components/results/RevenueEstimateDisclaimer';
+import { SecondaryMetricsGrid } from '@/components/results/SecondaryMetricsGrid';
+import { RecoveryEvidenceList } from '@/components/results/RecoveryEvidenceList';
+import { RecoveryTrend } from '@/components/results/RecoveryTrend';
+import { StillAtRiskBanner } from '@/components/results/StillAtRiskBanner';
+import {
+  ResultsSkeleton,
+  ResultsZeroState,
+  ResultsEarlyUsageState,
+  ResultsErrorState,
+  ResultsPartialBanner,
+} from '@/components/results/States';
+
+export default function ResultsPage() {
+  const router = useRouter();
+  const { businessId, isMobile } = useAuthedBusiness();
+  const [period, setPeriod] = useState<ResultsPeriod>(30);
+
+  const { data, settings, loading, error, isPartial, refresh, lastRefreshedAt } = useResults(
+    businessId,
+    period
+  );
+
+  // Pull-to-refresh (mobile) support via native scroll listener could be wired
+  // in a shared layout; here we expose a manual refresh affordance instead.
+  const handleRefresh = useCallback(() => refresh(), [refresh]);
+
+  const goToOpportunities = useCallback(
+    (filter: 'recovered' | 'at_risk' | 'reactivated' | 'booked' | 'lost') => {
+      router.push(`/opportunities?filter=${filter}&period=${period}`);
+    },
+    [router, period]
+  );
+
+  const goToRecoveryQueue = useCallback(() => {
+    router.push('/recovery-queue?filter=at_risk');
+  }, [router]);
+
+  const goToOpportunityDetail = useCallback(
+    (opportunityId: string) => {
+      router.push(`/opportunities/${opportunityId}`);
+    },
+    [router]
+  );
+
+  const goToAccountCustomerValue = useCallback(() => {
+    router.push('/account/settings#typical-customer-value');
+  }, [router]);
+
+  const [revenueExplainerOpen, setRevenueExplainerOpen] = useState(false);
+
+  useEffect(() => {
+    document.title = 'Results — Isolynic';
+  }, []);
+
+  const headline = data?.headline ?? null;
+  const currency = settings?.currency ?? 'USD';
+  const locale = settings?.locale ?? 'en-US';
+  const hasTypicalValue = !!settings?.typical_customer_value;
+
+  const isTrulyEmpty =
+    !loading && !error && headline && headline.opportunities_recovered === 0 &&
+    headline.opportunities_still_at_risk === 0 && headline.opportunities_lost === 0 &&
+    (data?.evidence?.length ?? 0) === 0 &&
+    // no activity at all recorded historically for this business
+    headline.customers_reactivated === 0 && headline.bookings_recovered === 0;
+
+  const isEarlyUsage =
+    !loading && !error && headline && headline.opportunities_recovered === 0 &&
+    !isTrulyEmpty;
+
+  return (
+    <main className="mx-auto w-full max-w-[1160px] px-4 sm:px-6 py-6 sm:py-10">
+      {/* Region A — Header */}
+      <header className="flex items-start sm:items-center justify-between gap-4 mb-6">
+        <div>
+          <h1 className="text-2xl font-semibold text-neutral-900">Results</h1>
+          <p className="hidden sm:block text-sm text-neutral-500 mt-0.5">
+            See what Isolynic recovered for your business.
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          {/* Region B — Time period selector */}
+          <TimePeriodSelector value={period} onChange={setPeriod} disabled={loading} />
+          
+            href="/help/results"
+            className="hidden sm:inline text-sm text-neutral-500 hover:text-neutral-800 focus:outline-none"
+          >
+            Help
+          </a>
+        </div>
+      </header>
+
+      {lastRefreshedAt && !loading && !error && (
+        <div className="flex items-center justify-between mb-4">
+          <span className="text-xs text-neutral-400">
+            {formatRelativeFreshness(lastRefreshedAt)}
+          </span>
+          <button
+            type="button"
+            onClick={handleRefresh}
+            className="text-xs text-neutral-500 hover:text-neutral-800 underline focus:outline-none"
+          >
+            Refresh
+          </button>
+        </div>
+      )}
+
+      {loading && <ResultsSkeleton />}
+
+      {!loading && error && <ResultsErrorState onRetry={handleRefresh} />}
+
+      {!loading && !error && isTrulyEmpty && (
+        <ResultsZeroState onLearnMore={() => router.push('/help/how-recovery-works')} />
+      )}
+
+      {!loading && !error && !isTrulyEmpty && isEarlyUsage && <ResultsEarlyUsageState />}
+
+      {!loading && !error && headline && !isTrulyEmpty && !isEarlyUsage && (
+        <div className="space-y-8">
+          {isPartial && <ResultsPartialBanner />}
+
+          {/* Region C — Primary value summary */}
+          <div>
+            <HeroMetric
+              headline={headline}
+              currency={currency}
+              locale={locale}
+              hasTypicalValue={hasTypicalValue}
+              onDrillOpportunitiesRecovered={() => goToOpportunities('recovered')}
+              onDrillBookings={() => goToOpportunities('booked')}
+              onOpenRevenueExplainer={() => setRevenueExplainerOpen(true)}
+              onAddCustomerValue={goToAccountCustomerValue}
+            />
+            {headline.estimated_revenue_recovered !== null && (
+              <RevenueEstimateNote />
+            )}
+          </div>
+
+          {/* Region D — Outcome breakdown */}
+          <SecondaryMetricsGrid
+            headline={headline}
+            onDrillReactivated={() => goToOpportunities('reactivated')}
+            onDrillAtRisk={() => goToOpportunities('at_risk')}
+            onDrillLost={() => goToOpportunities('lost')}
+          />
+
+          {/* Region E — Recovery evidence */}
+          {data && data.evidence.length > 0 && (
+            <RecoveryEvidenceList items={data.evidence} onSelect={goToOpportunityDetail} />
+          )}
+
+          {/* Region F — Lightweight historical view */}
+          {data && data.trend.length > 0 && (
+            <RecoveryTrend points={data.trend} isMobile={isMobile} />
+          )}
+
+          {/* Still-at-risk CTA — feeds back into action, never a dead end */}
+          <StillAtRiskBanner
+            count={headline.opportunities_still_at_risk}
+            onReview={goToRecoveryQueue}
+          />
+        </div>
+      )}
+    </main>
+  );
+}
+```
+
+---
+
+## 7. Cloud Functions v2 (TypeScript) — `functions/src/results.ts`
+
+Aggregation is necessary here: computing headline metrics, trend buckets, and recovery evidence from raw opportunity events on every page load would be slow and expensive, and attribution logic (section 26–27, 44) must be centralized and consistent — so this belongs server-side, not client-side.
+
+```typescript
+// functions/src/results.ts
+import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import { onDocumentWritten } from 'firebase-functions/v2/firestore';
+import { onSchedule } from 'firebase-functions/v2/scheduler';
+import { logger } from 'firebase-functions/v2';
+import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
+import { initializeApp, getApps } from 'firebase-admin/app';
+
+if (!getApps().length) {
+  initializeApp();
+}
+const db = getFirestore();
+
+// ---------- Types (mirrors client types/results.ts) ----------
+
+type ResultOutcome =
+  | 'ACTIVE'
+  | 'AT_RISK'
+  | 'RECOVERED'
+  | 'BOOKED'
+  | 'LOST'
+  | 'DECLINED'
+  | 'OWNER_HANDLED';
+
+type AttributionStatus = 'ATTRIBUTED' | 'PROBABLE' | 'UNCONFIRMED' | 'NOT_ATTRIBUTED';
+
+interface OpportunityResult {
+  opportunity_id: string;
+  business_id: string;
+  customer_id: string;
+  customer_name: string;
+  detected_at: number;
+  risk_started_at: number | null;
+  recovery_action_at: number | null;
+  reengaged_at: number | null;
+  booking_at: number | null;
+  outcome: ResultOutcome;
+  estimated_value: number | null;
+  attribution_status: AttributionStatus;
+  source_channel: string;
+  manual_override?: 'RECOVERED' | 'NOT_RECOVERED' | null;
+  summary_stage_label?: string;
+  summary_intervention_label?: string;
+  summary_outcome_label?: string;
+  updated_at: number;
+}
+
+type ResultsPeriod = 7 | 30 | 90;
+
+// Recovery attribution window (section 27) — configurable but must be applied
+// consistently. Defaulted here; can be product-tuned via /config/results doc.
+const DEFAULT_ATTRIBUTION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+// Statuses that are allowed to count toward headline "recovered" metrics (section 26/44).
+const RECOVERY_ELIGIBLE_ATTRIBUTION: AttributionStatus[] = ['ATTRIBUTED', 'PROBABLE'];
+
+// ---------- Helpers ----------
+
+function periodBounds(periodDays: ResultsPeriod, now: number) {
+  const end = now;
+  const start = now - periodDays * 24 * 60 * 60 * 1000;
+  const prevEnd = start;
+  const prevStart = start - periodDays * 24 * 60 * 60 * 1000;
+  return { start, end, prevStart, prevEnd };
+}
+
+function isRecovered(o: OpportunityResult, windowMs: number): boolean {
+  if (o.manual_override === 'NOT_RECOVERED') return false;
+  if (o.manual_override === 'RECOVERED') return true;
+
+  if (!RECOVERY_ELIGIBLE_ATTRIBUTION.includes(o.attribution_status)) return false;
+  if (!o.recovery_action_at || !o.reengaged_at) return false;
+  if (o.reengaged_at < o.recovery_action_at) return false;
+  if (o.reengaged_at - o.recovery_action_at > windowMs) return false;
+
+  // Must show meaningful progression, not just an automated reply with no
+  // subsequent behavior (section 11) — reengaged_at existing satisfies this
+  // because upstream event capture only sets it on qualifying customer actions.
+  return o.outcome === 'RECOVERED' || o.outcome === 'BOOKED';
+}
+
+function isReactivated(o: OpportunityResult): boolean {
+  return !!o.reengaged_at && o.outcome !== 'LOST' && o.outcome !== 'DECLINED';
+}
+
+function isBookingRecovered(o: OpportunityResult, windowMs: number): boolean {
+  return isRecovered(o, windowMs) && o.outcome === 'BOOKED' && !!o.booking_at;
+}
+
+function isStillAtRisk(o: OpportunityResult): boolean {
+  return o.outcome === 'AT_RISK';
+}
+
+function isLost(o: OpportunityResult): boolean {
+  return o.outcome === 'LOST';
+}
+
+function firstName(fullName: string): string {
+  const trimmed = (fullName || '').trim();
+  if (!trimmed) return 'A customer';
+  return trimmed.split(/\s+/)[0];
+}
+
+function weekBucketLabel(index: number): string {
+  return `W${index + 1}`;
+}
+
+async function fetchOpportunities(
+  businessId: string,
+  start: number,
+  end: number
+): Promise<OpportunityResult[]> {
+  // Query on detected_at within the window; opportunities that started before
+  // the window but resolved within it are also relevant for "recovered" counts,
+  // so we additionally query on a resolved_at-style field if present. For V1,
+  // we index on `updated_at` to capture any opportunity touched during the period.
+  const snap = await db
+    .collection('businesses')
+    .doc(businessId)
+    .collection('opportunityResults')
+    .where('updated_at', '>=', start)
+    .where('updated_at', '<=', end)
+    .get();
+
+  return snap.docs.map((d) => d.data() as OpportunityResult);
+}
+
+async function getAttributionWindowMs(businessId: string): Promise<number> {
+  const cfgSnap = await db.collection('businesses').doc(businessId).get();
+  const cfg = cfgSnap.data();
+  return cfg?.recovery_attribution_window_ms ?? DEFAULT_ATTRIBUTION_WINDOW_MS;
+}
+
+async function computeBundleForPeriod(businessId: string, period: ResultsPeriod, now: number) {
+  const { start, end, prevStart, prevEnd } = periodBounds(period, now);
+  const windowMs = await getAttributionWindowMs(businessId);
+
+  const [current, previous, settingsSnap] = await Promise.all([
+    fetchOpportunities(businessId, start, end),
+    fetchOpportunities(businessId, prevStart, prevEnd),
+    db.collection('businesses').doc(businessId).get(),
+  ]);
+
+  const settings = settingsSnap.data() ?? {};
+  const typicalCustomerValue: number | null = settings.typical_customer_value ?? null;
+  const typicalBookingValue: number | null = settings.typical_booking_value ?? null;
+
+  const recovered = current.filter((o) => isRecovered(o, windowMs));
+  const reactivated = current.filter((o) => isReactivated(o));
+  const bookingsRecovered = current.filter((o) => isBookingRecovered(o, windowMs));
+  const stillAtRisk = current.filter((o) => isStillAtRisk(o));
+  const lost = current.filter((o) => isLost(o));
+
+  const prevRecoveredCount = previous.filter((o) => isRecovered(o, windowMs)).length;
+  const previousPeriodHasEnoughData = previous.length >= 5; // section 30: minimum meaningful volume
+
+  // Revenue estimate (section 14, 46) — verified values take priority over estimates,
+  // and the two are tracked separately, never silently summed together.
+  let verifiedRevenue = 0;
+  let verifiedCount = 0;
+  let estimableRecoveredCount = 0;
+
+  for (const o of recovered) {
+    if (o.estimated_value !== null && o.attribution_status === 'ATTRIBUTED' && o.manual_override === 'RECOVERED') {
+      // Treated as verified only when explicitly confirmed by the owner with a value.
+      verifiedRevenue += o.estimated_value;
+      verifiedCount += 1;
+    } else {
+      estimableRecoveredCount += 1;
+    }
+  }
+
+  let estimatedFromTypical = 0;
+  if (typicalCustomerValue) {
+    estimatedFromTypical += estimableRecoveredCount * typicalCustomerValue;
+  }
+  if (typicalBookingValue) {
+    // Avoid double counting: booking value estimate replaces base customer
+    // value estimate for the subset that also became bookings.
+    const bookingSubset = bookingsRecovered.filter(
+      (o) => !(o.estimated_value !== null && o.manual_override === 'RECOVERED')
+    ).length;
+    estimatedFromTypical += bookingSubset * (typicalBookingValue - (typicalCustomerValue ?? 0));
+  }
+
+  let estimatedRevenueRecovered: number | null = null;
+  let basis: 'CUSTOMER_PROVIDED' | 'VERIFIED' | 'MIXED' | 'NONE' = 'NONE';
+
+  if (verifiedCount > 0 && estimableRecoveredCount > 0 && typicalCustomerValue) {
+    estimatedRevenueRecovered = verifiedRevenue + estimatedFromTypical;
+    basis = 'MIXED';
+  } else if (verifiedCount > 0) {
+    estimatedRevenueRecovered = verifiedRevenue;
+    basis = 'VERIFIED';
+  } else if (typicalCustomerValue) {
+    estimatedRevenueRecovered = estimatedFromTypical;
+    basis = 'CUSTOMER_PROVIDED';
+  }
+
+  // Trend buckets — weekly for 30/90 day windows, daily-ish for 7 days.
+  const bucketCount = period === 7 ? 7 : period === 30 ? 4 : Math.min(12, Math.ceil(period / 7));
+  const bucketMs = (end - start) / bucketCount;
+  const trend = Array.from({ length: bucketCount }).map((_, i) => {
+    const bStart = start + i * bucketMs;
+    const bEnd = bStart + bucketMs;
+    const count = recovered.filter((o) => {
+      const t = o.reengaged_at ?? o.updated_at;
+      return t >= bStart && t < bEnd;
+    }).length;
+    return {
+      label: period === 7 ? shortDayLabel(bStart) : weekBucketLabel(i),
+      recovered_count: count,
+      period_start: bStart,
+      period_end: bEnd,
+    };
+  });
+
+  // Recovery evidence — up to 5 recent, privacy-safe examples (sections 17-18).
+  const evidence = recovered
+    .filter((o) => o.summary_stage_label && o.summary_intervention_label && o.summary_outcome_label)
+    .sort((a, b) => (b.reengaged_at ?? 0) - (a.reengaged_at ?? 0))
+    .slice(0, 5)
+    .map((o) => ({
+      opportunity_id: o.opportunity_id,
+      customer_first_name: firstName(o.customer_name),
+      stage_label: o.summary_stage_label!,
+      intervention_label: o.summary_intervention_label!,
+      outcome_label: o.summary_outcome_label!,
+      occurred_at: o.reengaged_at ?? o.updated_at,
+    }));
+
+  const headline = {
+    business_id: businessId,
+    period_days: period,
+    period_start: start,
+    period_end: end,
+    opportunities_recovered: recovered.length,
+    customers_reactivated: reactivated.length,
+    bookings_recovered: bookingsRecovered.length,
+    opportunities_still_at_risk: stillAtRisk.length,
+    opportunities_lost: lost.length,
+    estimated_revenue_recovered: estimatedRevenueRecovered,
+    estimated_revenue_basis: basis,
+    previous_period_opportunities_recovered: previousPeriodHasEnoughData ? prevRecoveredCount : null,
+    previous_period_has_enough_data: previousPeriodHasEnoughData,
+    computed_at: now,
+    is_partial: false,
+  };
+
+  return { headline, trend, evidence };
+}
+
+function shortDayLabel(ms: number): string {
+  return new Date(ms).toLocaleDateString('en-US', { weekday: 'short' });
+}
+
+// ---------- Callable: on-demand compute (used by client on cache miss / refresh) ----------
+
+export const computeResultsForBusiness = onCall(
+  { region: 'us-central1', cors: true },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError('unauthenticated', 'Sign in required.');
+
+    const { businessId, period, force } = request.data as {
+      businessId: string;
+      period: ResultsPeriod;
+      force?: boolean;
+    };
+
+    if (!businessId || ![7, 30, 90].includes(period)) {
+      throw new HttpsError('invalid-argument', 'A valid businessId and period are required.');
+    }
+
+    await assertOwnerOfBusiness(uid, businessId);
+
+    const cacheRef = db
+      .collection('businesses')
+      .doc(businessId)
+      .collection('resultsCache')
+      .doc(String(period));
+
+    if (!force) {
+      const cached = await cacheRef.get();
+      if (cached.exists) {
+        const data = cached.data();
+        const fresh = data?.headline?.computed_at && Date.now() - data.headline.computed_at < 60_000;
+        if (fresh) return { cached: true };
+      }
+    }
+
+    try {
+      const bundle = await computeBundleForPeriod(businessId, period, Date.now());
+      await cacheRef.set(bundle);
+      return { cached: false };
+    } catch (err) {
+      logger.error('computeResultsForBusiness failed', { businessId, period, err });
+      // Mark partial so the client can show the "still updating" state rather
+      // than a hard error if a stale cache exists.
+      await cacheRef.set({ headline: { is_partial: true } }, { merge: true }).catch(() => {});
+      throw new HttpsError('internal', "We couldn't load your results.");
+    }
+  }
+);
+
+// ---------- Callable: manual correction (section 28) ----------
+
+export const submitResultCorrection = onCall(
+  { region: 'us-central1', cors: true },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError('unauthenticated', 'Sign in required.');
+
+    const { businessId, opportunityId, wasRecovered } = request.data as {
+      businessId: string;
+      opportunityId: string;
+      wasRecovered: boolean;
+    };
+
+    if (!businessId || !opportunityId || typeof wasRecovered !== 'boolean') {
+      throw new HttpsError('invalid-argument', 'Missing required fields.');
+    }
+
+    await assertOwnerOfBusiness(uid, businessId);
+
+    const oppRef = db
+      .collection('businesses')
+      .doc(businessId)
+      .collection('opportunityResults')
+      .doc(opportunityId);
+
+    const oppSnap = await oppRef.get();
+    if (!oppSnap.exists) throw new HttpsError('not-found', 'Opportunity not found.');
+
+    await oppRef.update({
+      manual_override: wasRecovered ? 'RECOVERED' : 'NOT_RECOVERED',
+      updated_at: Date.now(),
+    });
+
+    // Invalidate cached result docs so next load recomputes.
+    const cacheColl = db.collection('businesses').doc(businessId).collection('resultsCache');
+    const batch = db.batch();
+    for (const p of [7, 30, 90]) {
+      batch.set(cacheColl.doc(String(p)), { headline: { is_partial: true } }, { merge: true });
+    }
+    await batch.commit();
+
+    return { ok: true };
+  }
+);
+
+async function assertOwnerOfBusiness(uid: string, businessId: string) {
+  const bizSnap = await db.collection('businesses').doc(businessId).get();
+  if (!bizSnap.exists) throw new HttpsError('not-found', 'Business not found.');
+  const biz = bizSnap.data();
+  if (biz?.owner_uid !== uid) {
+    throw new HttpsError('permission-denied', 'Not authorized for this business.');
+  }
+}
+
+// ---------- Trigger: keep resultsCache invalidated when raw opportunity data changes ----------
+
+export const onOpportunityResultWrite = onDocumentWritten(
+  'businesses/{businessId}/opportunityResults/{opportunityId}',
+  async (event) => {
+    const businessId = event.params.businessId as string;
+    const cacheColl = db.collection('businesses').doc(businessId).collection('resultsCache');
+
+    const batch = db.batch();
+    for (const p of [7, 30, 90]) {
+      batch.set(cacheColl.doc(String(p)), { headline: { is_partial: true } }, { merge: true });
+    }
+    await batch.commit();
+  }
+);
+
+// ---------- Scheduled: recompute all businesses' caches periodically ----------
+// Keeps "Updated N minutes ago" meaningful without relying solely on user-triggered
+// refreshes, and keeps computeResultsForBusiness calls cheap for the client.
+
+export const recomputeResultsCachesScheduled = onSchedule(
+  { schedule: 'every 15 minutes', region: 'us-central1', timeZone: 'UTC' },
+  async () => {
+    const businessesSnap = await db.collection('businesses').get();
+    const now = Date.now();
+
+    const jobs = businessesSnap.docs.map(async (bizDoc) => {
+      const businessId = bizDoc.id;
+      for (const period of [7, 30, 90] as ResultsPeriod[]) {
+        try {
+          const bundle = await computeBundleForPeriod(businessId, period, now);
+          await db
+            .collection('businesses')
+            .doc(businessId)
+            .collection('resultsCache')
+            .doc(String(period))
+            .set(bundle);
+        } catch (err) {
+          logger.error('scheduled recompute failed', { businessId, period, err });
+        }
+      }
+    });
+
+    await Promise.all(jobs);
+  }
+);
+
+// ---------- Scheduled: weekly summary notification (section 56-57) ----------
+
+export const weeklyResultsSummary = onSchedule(
+  { schedule: 'every monday 09:00', region: 'us-central1', timeZone: 'UTC' },
+  async () => {
+    const businessesSnap = await db.collection('businesses').get();
+    const now = Date.now();
+
+    const jobs = businessesSnap.docs.map(async (bizDoc) => {
+      const businessId = bizDoc.id;
+      const business = bizDoc.data();
+      if (business.notifications_opt_out?.weekly_summary) return;
+
+      try {
+        const bundle = await computeBundleForPeriod(businessId, 7, now);
+        const h = bundle.headline;
+
+        // Skip sending an empty, potentially discouraging notification.
+        if (h.opportunities_recovered === 0 && h.opportunities_still_at_risk === 0) return;
+
+        await db
+          .collection('businesses')
+          .doc(businessId)
+          .collection('notifications')
+          .add({
+            type: 'weekly_results_summary',
+            title: `You recovered ${h.opportunities_recovered} customer opportunit${
+              h.opportunities_recovered === 1 ? 'y' : 'ies'
+            } this week.`,
+            body: `${h.bookings_recovered} became bookings.`,
+            cta_label: 'See your results',
+            cta_route: '/results?period=7',
+            created_at: now,
+            read: false,
+          });
+      } catch (err) {
+        logger.error('weeklyResultsSummary failed', { businessId, err });
+      }
+    });
+
+    await Promise.all(jobs);
+  }
+);
+```
+
+---
+
+## 8. Functions Entry Point — `functions/src/index.ts`
+
+```typescript
+// functions/src/index.ts
+export {
+  computeResultsForBusiness,
+  submitResultCorrection,
+  onOpportunityResultWrite,
+  recomputeResultsCachesScheduled,
+  weeklyResultsSummary,
+} from './results';
+```
+
+---
+
+## 9. Firestore Security Rules (Results-relevant slice) — `firestore.rules`
+
+```
+match /businesses/{businessId} {
+  allow read: if request.auth != null && resource.data.owner_uid == request.auth.uid;
+  allow write: if false; // owner-facing writes go through callable functions only
+
+  match /opportunityResults/{opportunityId} {
+    allow read: if request.auth != null &&
+      get(/databases/$(database)/documents/businesses/$(businessId)).data.owner_uid == request.auth.uid;
+    allow write: if false; // written only by backend ingestion / functions
+  }
+
+  match /resultsCache/{period} {
+    allow read: if request.auth != null &&
+      get(/databases/$(database)/documents/businesses/$(businessId)).data.owner_uid == request.auth.uid;
+    allow write: if false; // written only by Cloud Functions
+  }
+
+  match /notifications/{notificationId} {
+    allow read: if request.auth != null &&
+      get(/databases/$(database)/documents/businesses/$(businessId)).data.owner_uid == request.auth.uid;
+    allow update: if request.auth != null &&
+      get(/databases/$(database)/documents/businesses/$(businessId)).data.owner_uid == request.auth.uid &&
+      request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+    allow write: if false;
+  }
+}
+```
+
+---
+
+### Design notes tying this back to the spec
+- **Attribution (§10–11, §26–27, §44)** lives entirely in `results.ts` on the backend (`isRecovered`, attribution window, `manual_override`), never on the client — so the headline number can't be inflated and stays consistent across all consumers.
+- **Revenue estimate (§13–16, §46)** keeps verified and estimated amounts distinguishable in the data model (`estimated_revenue_basis`), and the UI always labels it "estimated" with the two-tier disclosure from §15.
+- **No vanity metrics (§31)** — nothing in `ResultsHeadline` or the UI surfaces message/call/token counts.
+- **Every number drillable (§29)** — each metric component takes an `onDrill*` handler wired to filtered routes.
+- **Zero/early-usage/error/partial states (§22–23, §41–43)** are distinct components matching the exact copy specified.
+- **Mobile trend as list, not shrunk chart (§20)** — `RecoveryTrend` branches on `isMobile`.
+- **Privacy (§18)** — evidence items only ever expose `customer_first_name` and short stage labels, never full conversation content.

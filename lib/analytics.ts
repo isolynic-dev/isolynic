@@ -36,3 +36,45 @@ export async function track(
     // Analytics failures must never affect the user experience.
   }
 }
+
+
+
+
+
+
+// Event names as specified in §57 "Core Analytics for Home".
+export type HomeAnalyticsEvent =
+  | "home_viewed"
+  | "attention_card_viewed"
+  | "review_customers_clicked"
+  | "needs_you_clicked"
+  | "recovery_results_clicked"
+  | "activity_item_clicked"
+  | "home_refresh"
+  | "home_load_time"
+  | "home_error"
+  | "customer_action_completed";
+
+interface AnalyticsPayload {
+  [key: string]: string | number | boolean | undefined;
+}
+
+/**
+ * Thin analytics facade. Swap the internals for Segment / Amplitude / GA4 /
+ * a Firebase Analytics logEvent call without touching call sites.
+ */
+export function track(event: HomeAnalyticsEvent, payload: AnalyticsPayload = {}): void {
+  if (typeof window === "undefined") return;
+  try {
+    // Example real wiring:
+    // import { getAnalytics, logEvent } from "firebase/analytics";
+    // logEvent(getAnalytics(app), event, payload);
+    if (process.env.NODE_ENV !== "production") {
+      // eslint-disable-next-line no-console
+      console.debug(`[analytics] ${event}`, payload);
+    }
+    window.dispatchEvent(new CustomEvent("isolynic:analytics", { detail: { event, payload } }));
+  } catch {
+    // Analytics must never break the product experience.
+  }
+}

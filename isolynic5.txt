@@ -1,0 +1,3344 @@
+Here's the complete Screen 5 (Conversation) implementation — types, Firestore hooks, all UI components, the page, and the Cloud Functions v2 backend.
+
+---
+
+## 1. `types/conversation.ts`
+
+```typescript
+// types/conversation.ts
+
+import { Timestamp } from "firebase/firestore";
+
+export type Channel = "whatsapp" | "phone" | "website" | "sms";
+
+export type SenderType = "CUSTOMER" | "ISOLYNIC" | "OWNER" | "SYSTEM";
+
+export type OwnershipMode = "ISOLYNIC" | "OWNER" | "WAITING";
+
+export type OpportunityStatus =
+  | "active"
+  | "isolynic_handling"
+  | "waiting_for_customer"
+  | "needs_attention"
+  | "booked"
+  | "recovered"
+  | "lost";
+
+export type DeliveryStatus =
+  | "sending"
+  | "sent"
+  | "delivered"
+  | "read"
+  | "failed";
+
+export type MessageAttachment = {
+  id: string;
+  type: "image" | "audio" | "document";
+  url: string;
+  thumbnailUrl?: string;
+  mimeType: string;
+  sizeBytes?: number;
+  durationSeconds?: number; // for audio
+  transcript?: string; // for voice messages
+  aiCaption?: string; // for images, hedged language only
+};
+
+export type ConversationMessage = {
+  id: string;
+  conversationId: string;
+  senderType: SenderType;
+  channel: Channel;
+  body: string;
+  attachments: MessageAttachment[];
+  timestamp: Timestamp;
+  deliveryStatus?: DeliveryStatus;
+  providerReference?: string;
+  isAutomaticFollowUp?: boolean; // labels "Automatic follow-up" on Isolynic messages
+  isPrivateNote?: boolean;
+};
+
+export type SystemEventType =
+  | "missed_call"
+  | "call_completed"
+  | "quote_sent"
+  | "quote_requested"
+  | "booking_created"
+  | "booking_updated"
+  | "owner_takeover"
+  | "owner_released"
+  | "recovery_started"
+  | "recovery_completed"
+  | "status_changed"
+  | "conversation_closed"
+  | "not_opportunity";
+
+export type SystemEvent = {
+  id: string;
+  conversationId: string;
+  type: SystemEventType;
+  label: string; // human-friendly, already composed server-side
+  timestamp: Timestamp;
+  metadata?: Record<string, unknown>;
+};
+
+export type TimelineItem =
+  | { kind: "message"; data: ConversationMessage }
+  | { kind: "system_event"; data: SystemEvent };
+
+export type RecommendedAction = {
+  action: "recover" | "take_over" | "no_action" | "book";
+  reason: string;
+};
+
+export type BookingDetails = {
+  id: string;
+  startTime: Timestamp;
+  endTime: Timestamp;
+  timezone: string;
+  status: "confirmed" | "cancelled" | "completed";
+  calendarEventId?: string;
+};
+
+export type Customer = {
+  id: string;
+  name: string;
+  phone?: string;
+  preferredChannel: Channel;
+  identityConfidence?: "confirmed" | "possible_match";
+  possibleDuplicateCustomerId?: string;
+};
+
+export type Conversation = {
+  id: string;
+  businessId: string;
+  customerId: string;
+  opportunityId: string;
+  channel: Channel;
+  status: OpportunityStatus;
+  ownershipMode: OwnershipMode;
+  summary: string; // rolling AI-maintained summary
+  whyHere: string | null; // recovery / attention explanation
+  recommendedAction: RecommendedAction | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  lastCustomerActivity: Timestamp | null;
+  lastOwnerActivity: Timestamp | null;
+  lastIsolynicActivity: Timestamp | null;
+  currentBooking: BookingDetails | null;
+  isClosed: boolean;
+  closedReason?: string;
+};
+
+export type PrivateNote = {
+  id: string;
+  conversationId: string;
+  authorId: string;
+  body: string;
+  createdAt: Timestamp;
+};
+```
+
+---
+
+## 2. `lib/firebase/client.ts`
+
+```typescript
+// lib/firebase/client.ts
+
+import { initializeApp, getApps, getApp } from "firebase/app";
+import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager } from "firebase/firestore";
+import { getAuth } from "firebase/auth";
+import { getFunctions } from "firebase/functions";
+import { getStorage } from "firebase/storage";
+
+const firebaseConfig = {
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
+};
+
+export const firebaseApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
+
+// Offline-first cache so the PWA can show "recent conversation" while offline (spec §99).
+export const db =
+  typeof window !== "undefined"
+    ? initializeFirestore(firebaseApp, {
+        localCache: persistentLocalCache({
+          tabManager: persistentMultipleTabManager(),
+        }),
+      })
+    : getFirestore(firebaseApp);
+
+export const auth = getAuth(firebaseApp);
+export const functions = getFunctions(firebaseApp, "us-central1");
+export const storage = getStorage(firebaseApp);
+```
+
+---
+
+## 3. `hooks/useConversation.ts`
+
+```typescript
+// hooks/useConversation.ts
+
+"use client";
+
+import { useEffect, useState } from "react";
+import { doc, onSnapshot, DocumentData, FirestoreError } from "firebase/firestore";
+import { db } from "@/lib/firebase/client";
+import { Conversation } from "@/types/conversation";
+
+type UseConversationResult = {
+  conversation: Conversation | null;
+  loading: boolean;
+  error: FirestoreError | null;
+};
+
+function mapConversation(id: string, data: DocumentData): Conversation {
+  return {
+    id,
+    businessId: data.businessId,
+    customerId: data.customerId,
+    opportunityId: data.opportunityId,
+    channel: data.channel,
+    status: data.status,
+    ownershipMode: data.ownershipMode,
+    summary: data.summary ?? "",
+    whyHere: data.whyHere ?? null,
+    recommendedAction: data.recommendedAction ?? null,
+    createdAt: data.createdAt,
+    updatedAt: data.updatedAt,
+    lastCustomerActivity: data.lastCustomerActivity ?? null,
+    lastOwnerActivity: data.lastOwnerActivity ?? null,
+    lastIsolynicActivity: data.lastIsolynicActivity ?? null,
+    currentBooking: data.currentBooking ?? null,
+    isClosed: !!data.isClosed,
+    closedReason: data.closedReason,
+  };
+}
+
+/**
+ * Real-time subscription to a single conversation document.
+ * Backs header/status/banner state (spec §41 real-time behavior).
+ */
+export function useConversation(conversationId: string | null): UseConversationResult {
+  const [conversation, setConversation] = useState<Conversation | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<FirestoreError | null>(null);
+
+  useEffect(() => {
+    if (!conversationId) {
+      setConversation(null);
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+    const ref = doc(db, "conversations", conversationId);
+
+    const unsubscribe = onSnapshot(
+      ref,
+      (snap) => {
+        if (!snap.exists()) {
+          setConversation(null);
+          setLoading(false);
+          return;
+        }
+        setConversation(mapConversation(snap.id, snap.data()));
+        setLoading(false);
+      },
+      (err) => {
+        setError(err);
+        setLoading(false);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [conversationId]);
+
+  return { conversation, loading, error };
+}
+```
+
+---
+
+## 4. `hooks/useConversationTimeline.ts`
+
+```typescript
+// hooks/useConversationTimeline.ts
+
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  collection,
+  query,
+  orderBy,
+  limit,
+  limitToLast,
+  startAfter,
+  endBefore,
+  onSnapshot,
+  getDocs,
+  Timestamp,
+  QueryDocumentSnapshot,
+  DocumentData,
+} from "firebase/firestore";
+import { db } from "@/lib/firebase/client";
+import { ConversationMessage, SystemEvent, TimelineItem } from "@/types/conversation";
+
+const PAGE_SIZE = 40;
+
+function mapMessage(id: string, data: DocumentData): ConversationMessage {
+  return {
+    id,
+    conversationId: data.conversationId,
+    senderType: data.senderType,
+    channel: data.channel,
+    body: data.body ?? "",
+    attachments: data.attachments ?? [],
+    timestamp: data.timestamp,
+    deliveryStatus: data.deliveryStatus,
+    providerReference: data.providerReference,
+    isAutomaticFollowUp: !!data.isAutomaticFollowUp,
+    isPrivateNote: !!data.isPrivateNote,
+  };
+}
+
+function mapSystemEvent(id: string, data: DocumentData): SystemEvent {
+  return {
+    id,
+    conversationId: data.conversationId,
+    type: data.type,
+    label: data.label,
+    timestamp: data.timestamp,
+    metadata: data.metadata ?? {},
+  };
+}
+
+/**
+ * Windowed / paginated conversation timeline (spec §58 — never load an
+ * unbounded conversation into the browser). Subscribes in real time to the
+ * most recent PAGE_SIZE items, and supports loading older history on demand
+ * (one-shot fetch, not subscribed, to bound listener cost).
+ */
+export function useConversationTimeline(conversationId: string | null) {
+  const [items, setItems] = useState<TimelineItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  const oldestDocRef = useRef<QueryDocumentSnapshot<DocumentData> | null>(null);
+
+  const toTimelineItem = useCallback(
+    (docSnap: QueryDocumentSnapshot<DocumentData>): TimelineItem => {
+      const data = docSnap.data();
+      if (data._collectionType === "system_event") {
+        return { kind: "system_event", data: mapSystemEvent(docSnap.id, data) };
+      }
+      return { kind: "message", data: mapMessage(docSnap.id, data) };
+    },
+    []
+  );
+
+  // Live subscription to the latest window.
+  useEffect(() => {
+    if (!conversationId) {
+      setItems([]);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+
+    const timelineRef = collection(db, "conversations", conversationId, "timeline");
+    const q = query(timelineRef, orderBy("timestamp", "desc"), limit(PAGE_SIZE));
+
+    const unsubscribe = onSnapshot(q, (snap) => {
+      const mapped = snap.docs.map(toTimelineItem).reverse(); // chronological asc
+      setItems(mapped);
+      oldestDocRef.current = snap.docs[snap.docs.length - 1] ?? null;
+      setHasMore(snap.docs.length === PAGE_SIZE);
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [conversationId, toTimelineItem]);
+
+  const loadOlder = useCallback(async () => {
+    if (!conversationId || !oldestDocRef.current || loadingMore || !hasMore) return;
+    setLoadingMore(true);
+    try {
+      const timelineRef = collection(db, "conversations", conversationId, "timeline");
+      const q = query(
+        timelineRef,
+        orderBy("timestamp", "desc"),
+        startAfter(oldestDocRef.current),
+        limit(PAGE_SIZE)
+      );
+      const snap = await getDocs(q);
+      const older = snap.docs.map(toTimelineItem).reverse();
+      setItems((prev) => [...older, ...prev]);
+      oldestDocRef.current = snap.docs[snap.docs.length - 1] ?? oldestDocRef.current;
+      setHasMore(snap.docs.length === PAGE_SIZE);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [conversationId, hasMore, loadingMore, toTimelineItem]);
+
+  return { items, loading, loadingMore, hasMore, loadOlder };
+}
+```
+
+---
+
+## 5. `hooks/useCustomer.ts`
+
+```typescript
+// hooks/useCustomer.ts
+
+"use client";
+
+import { useEffect, useState } from "react";
+import { doc, onSnapshot } from "firebase/firestore";
+import { db } from "@/lib/firebase/client";
+import { Customer } from "@/types/conversation";
+
+export function useCustomer(customerId: string | null) {
+  const [customer, setCustomer] = useState<Customer | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!customerId) {
+      setCustomer(null);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    const ref = doc(db, "customers", customerId);
+    const unsubscribe = onSnapshot(ref, (snap) => {
+      if (!snap.exists()) {
+        setCustomer(null);
+      } else {
+        setCustomer({ id: snap.id, ...(snap.data() as Omit<Customer, "id">) });
+      }
+      setLoading(false);
+    });
+    return () => unsubscribe();
+  }, [customerId]);
+
+  return { customer, loading };
+}
+```
+
+---
+
+## 6. `hooks/useConnectionStatus.ts`
+
+```typescript
+// hooks/useConnectionStatus.ts
+
+"use client";
+
+import { useEffect, useState } from "react";
+
+/**
+ * Tracks browser connectivity for offline banners (spec §99–100).
+ */
+export function useConnectionStatus() {
+  const [isOnline, setIsOnline] = useState(true);
+  const [justReconnected, setJustReconnected] = useState(false);
+
+  useEffect(() => {
+    setIsOnline(navigator.onLine);
+
+    const handleOnline = () => {
+      setIsOnline(true);
+      setJustReconnected(true);
+      setTimeout(() => setJustReconnected(false), 4000);
+    };
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
+  return { isOnline, justReconnected };
+}
+```
+
+---
+
+## 7. `lib/conversation/actions.ts` (client → callable function wrappers)
+
+```typescript
+// lib/conversation/actions.ts
+
+"use client";
+
+import { httpsCallable } from "firebase/functions";
+import { functions } from "@/lib/firebase/client";
+
+export async function sendOwnerMessage(conversationId: string, body: string) {
+  const fn = httpsCallable(functions, "sendOwnerMessage");
+  return fn({ conversationId, body });
+}
+
+export async function takeOverConversation(conversationId: string) {
+  const fn = httpsCallable(functions, "takeOverConversation");
+  return fn({ conversationId });
+}
+
+export async function releaseConversationToIsolynic(conversationId: string) {
+  const fn = httpsCallable(functions, "releaseConversationToIsolynic");
+  return fn({ conversationId });
+}
+
+export async function requestReplySuggestion(conversationId: string) {
+  const fn = httpsCallable<{ conversationId: string }, { suggestion: string | null }>(
+    functions,
+    "suggestReply"
+  );
+  const result = await fn({ conversationId });
+  return result.data.suggestion;
+}
+
+export async function markNotOpportunity(conversationId: string) {
+  const fn = httpsCallable(functions, "markNotOpportunity");
+  return fn({ conversationId });
+}
+
+export async function closeConversation(conversationId: string, reason: string) {
+  const fn = httpsCallable(functions, "closeConversation");
+  return fn({ conversationId, reason });
+}
+
+export async function reopenConversation(conversationId: string) {
+  const fn = httpsCallable(functions, "reopenConversation");
+  return fn({ conversationId });
+}
+
+export async function createBooking(
+  conversationId: string,
+  startTimeIso: string,
+  endTimeIso: string,
+  timezone: string
+) {
+  const fn = httpsCallable(functions, "createBooking");
+  return fn({ conversationId, startTimeIso, endTimeIso, timezone });
+}
+
+export async function getAvailableSlots(conversationId: string, dateIso: string) {
+  const fn = httpsCallable<
+    { conversationId: string; dateIso: string },
+    { slots: { startIso: string; endIso: string }[] }
+  >(functions, "getAvailableSlots");
+  const result = await fn({ conversationId, dateIso });
+  return result.data.slots;
+}
+
+export async function resolveIdentityMatch(
+  conversationId: string,
+  decision: "merge" | "keep_separate"
+) {
+  const fn = httpsCallable(functions, "resolveIdentityMatch");
+  return fn({ conversationId, decision });
+}
+
+export async function addPrivateNote(conversationId: string, body: string) {
+  const fn = httpsCallable(functions, "addPrivateNote");
+  return fn({ conversationId, body });
+}
+
+export async function deleteConversation(conversationId: string) {
+  const fn = httpsCallable(functions, "deleteConversationRequest");
+  return fn({ conversationId });
+}
+
+export async function retryFailedMessage(conversationId: string, messageId: string) {
+  const fn = httpsCallable(functions, "retryFailedMessage");
+  return fn({ conversationId, messageId });
+}
+```
+
+---
+
+## 8. `lib/format/time.ts`
+
+```typescript
+// lib/format/time.ts
+
+import { Timestamp } from "firebase/firestore";
+
+/**
+ * Timestamp display rules per spec §18/§60:
+ * - same day → "10:42 AM"
+ * - yesterday → "Yesterday, 4:42 PM"
+ * - older → "Aug 28"
+ * Always computed against the viewer's local time from a normalized
+ * server timestamp — never a client-guessed timezone offset for storage.
+ */
+export function formatTimelineTimestamp(ts: Timestamp | null | undefined): string {
+  if (!ts) return "";
+  const date = ts.toDate();
+  const now = new Date();
+
+  const isSameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  const isYesterday =
+    date.getFullYear() === yesterday.getFullYear() &&
+    date.getMonth() === yesterday.getMonth() &&
+    date.getDate() === yesterday.getDate();
+
+  const timeStr = date.toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+
+  if (isSameDay) return timeStr;
+  if (isYesterday) return `Yesterday, ${timeStr}`;
+
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+export function formatDaySeparator(ts: Timestamp): string {
+  const date = ts.toDate();
+  const now = new Date();
+
+  const isSameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  if (isSameDay) return "Today";
+
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  const isYesterday =
+    date.getFullYear() === yesterday.getFullYear() &&
+    date.getMonth() === yesterday.getMonth() &&
+    date.getDate() === yesterday.getDate();
+  if (isYesterday) return "Yesterday";
+
+  const daysAgo = Math.floor((now.getTime() - date.getTime()) / 86400000);
+  if (daysAgo < 7) {
+    return date.toLocaleDateString(undefined, { weekday: "long" });
+  }
+  return date.toLocaleDateString(undefined, { month: "long", day: "numeric" });
+}
+
+export function dayKey(ts: Timestamp): string {
+  const d = ts.toDate();
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+```
+
+---
+
+## 9. `components/conversation/StatusPill.tsx`
+
+```tsx
+// components/conversation/StatusPill.tsx
+
+import { OpportunityStatus } from "@/types/conversation";
+
+const STATUS_COPY: Record<OpportunityStatus, string> = {
+  active: "Active",
+  isolynic_handling: "Isolynic is handling this",
+  waiting_for_customer: "Waiting for customer",
+  needs_attention: "Needs your attention",
+  booked: "Booked",
+  recovered: "Recovered",
+  lost: "Closed",
+};
+
+const STATUS_STYLES: Record<OpportunityStatus, string> = {
+  active: "bg-slate-100 text-slate-700",
+  isolynic_handling: "bg-slate-100 text-slate-700",
+  waiting_for_customer: "bg-slate-100 text-slate-700",
+  needs_attention: "bg-amber-100 text-amber-800 border border-amber-300",
+  booked: "bg-emerald-100 text-emerald-800",
+  recovered: "bg-emerald-100 text-emerald-800",
+  lost: "bg-slate-100 text-slate-500",
+};
+
+// Non-color status indicator per accessibility spec §95 — an icon glyph
+// accompanies color so state is never conveyed by color alone.
+const STATUS_ICON: Record<OpportunityStatus, string> = {
+  active: "●",
+  isolynic_handling: "◐",
+  waiting_for_customer: "○",
+  needs_attention: "▲",
+  booked: "✓",
+  recovered: "✓",
+  lost: "■",
+};
+
+export function StatusPill({ status }: { status: OpportunityStatus }) {
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${STATUS_STYLES[status]}`}
+      role="status"
+    >
+      <span aria-hidden="true">{STATUS_ICON[status]}</span>
+      {STATUS_COPY[status]}
+    </span>
+  );
+}
+
+export { STATUS_COPY };
+```
+
+---
+
+## 10. `components/conversation/ConversationHeader.tsx`
+
+```tsx
+// components/conversation/ConversationHeader.tsx
+
+"use client";
+
+import { useState } from "react";
+import { ChevronLeft, MoreVertical } from "lucide-react";
+import { Conversation, Customer } from "@/types/conversation";
+import { StatusPill } from "./StatusPill";
+import { ConversationOverflowMenu } from "./ConversationOverflowMenu";
+
+type Props = {
+  conversation: Conversation;
+  customer: Customer | null;
+  onBack: () => void;
+};
+
+export function ConversationHeader({ conversation, customer, onBack }: Props) {
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  return (
+    <header className="sticky top-0 z-20 flex items-center gap-3 border-b border-slate-200 bg-white/95 px-4 py-3 backdrop-blur">
+      <button
+        onClick={onBack}
+        aria-label="Back"
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-slate-600 hover:bg-slate-100"
+      >
+        <ChevronLeft size={20} />
+      </button>
+
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <h1 className="truncate text-[17px] font-semibold text-slate-900">
+            {customer?.name ?? "Customer"}
+          </h1>
+        </div>
+        <div className="mt-0.5">
+          <StatusPill status={conversation.status} />
+        </div>
+      </div>
+
+      <div className="relative">
+        <button
+          onClick={() => setMenuOpen((v) => !v)}
+          aria-label="More options"
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          className="flex h-9 w-9 items-center justify-center rounded-full text-slate-600 hover:bg-slate-100"
+        >
+          <MoreVertical size={20} />
+        </button>
+        {menuOpen && (
+          <ConversationOverflowMenu
+            conversation={conversation}
+            onClose={() => setMenuOpen(false)}
+          />
+        )}
+      </div>
+    </header>
+  );
+}
+```
+
+---
+
+## 11. `components/conversation/ConversationOverflowMenu.tsx`
+
+```tsx
+// components/conversation/ConversationOverflowMenu.tsx
+
+"use client";
+
+import { useState } from "react";
+import { Conversation } from "@/types/conversation";
+import {
+  markNotOpportunity,
+  closeConversation,
+  reopenConversation,
+  deleteConversation,
+} from "@/lib/conversation/actions";
+import { ConfirmDialog } from "./ConfirmDialog";
+
+export function ConversationOverflowMenu({
+  conversation,
+  onClose,
+}: {
+  conversation: Conversation;
+  onClose: () => void;
+}) {
+  const [confirming, setConfirming] = useState<"delete" | "not_opportunity" | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function handleNotOpportunity() {
+    setBusy(true);
+    try {
+      await markNotOpportunity(conversation.id);
+    } finally {
+      setBusy(false);
+      setConfirming(null);
+      onClose();
+    }
+  }
+
+  async function handleCloseOrReopen() {
+    setBusy(true);
+    try {
+      if (conversation.isClosed) {
+        await reopenConversation(conversation.id);
+      } else {
+        await closeConversation(conversation.id, "Closed by owner");
+      }
+    } finally {
+      setBusy(false);
+      onClose();
+    }
+  }
+
+  async function handleDelete() {
+    setBusy(true);
+    try {
+      await deleteConversation(conversation.id);
+    } finally {
+      setBusy(false);
+      setConfirming(null);
+      onClose();
+    }
+  }
+
+  return (
+    <>
+      <div
+        role="menu"
+        className="absolute right-0 top-11 z-30 w-56 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-lg"
+      >
+        <button
+          role="menuitem"
+          disabled={busy}
+          onClick={() => setConfirming("not_opportunity")}
+          className="block w-full px-4 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-50"
+        >
+          Not an opportunity
+        </button>
+        <button
+          role="menuitem"
+          disabled={busy}
+          onClick={handleCloseOrReopen}
+          className="block w-full px-4 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-50"
+        >
+          {conversation.isClosed ? "Reopen" : "Close"}
+        </button>
+        <button
+          role="menuitem"
+          onClick={() => {
+            window.open("mailto:support@isolynic.com?subject=Report a problem", "_blank");
+            onClose();
+          }}
+          className="block w-full px-4 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-50"
+        >
+          Report a problem
+        </button>
+        <div className="my-1 border-t border-slate-100" />
+        <button
+          role="menuitem"
+          disabled={busy}
+          onClick={() => setConfirming("delete")}
+          className="block w-full px-4 py-2.5 text-left text-sm font-medium text-red-600 hover:bg-red-50"
+        >
+          Delete conversation
+        </button>
+      </div>
+
+      {confirming === "not_opportunity" && (
+        <ConfirmDialog
+          title="Remove from recovery?"
+          body="This conversation won't be treated as an opportunity anymore."
+          confirmLabel="Yes, remove"
+          onConfirm={handleNotOpportunity}
+          onCancel={() => setConfirming(null)}
+          busy={busy}
+        />
+      )}
+      {confirming === "delete" && (
+        <ConfirmDialog
+          title="Delete this conversation?"
+          body="This removes it from your Isolynic account."
+          confirmLabel="Delete"
+          destructive
+          onConfirm={handleDelete}
+          onCancel={() => setConfirming(null)}
+          busy={busy}
+        />
+      )}
+    </>
+  );
+}
+```
+
+---
+
+## 12. `components/conversation/ConfirmDialog.tsx`
+
+```tsx
+// components/conversation/ConfirmDialog.tsx
+
+"use client";
+
+export function ConfirmDialog({
+  title,
+  body,
+  confirmLabel,
+  destructive = false,
+  busy = false,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  destructive?: boolean;
+  busy?: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="confirm-dialog-title"
+      className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 sm:items-center"
+      onClick={onCancel}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-sm rounded-t-2xl bg-white p-5 shadow-xl sm:rounded-2xl"
+      >
+        <h2 id="confirm-dialog-title" className="text-base font-semibold text-slate-900">
+          {title}
+        </h2>
+        <p className="mt-1.5 text-sm text-slate-600">{body}</p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            onClick={onCancel}
+            className="rounded-lg px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={busy}
+            className={`rounded-lg px-4 py-2 text-sm font-medium text-white disabled:opacity-60 ${
+              destructive ? "bg-red-600 hover:bg-red-700" : "bg-slate-900 hover:bg-slate-800"
+            }`}
+          >
+            {busy ? "Working…" : confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+---
+
+## 13. `components/conversation/OpportunityBanner.tsx`
+
+```tsx
+// components/conversation/OpportunityBanner.tsx
+
+"use client";
+
+import { useState } from "react";
+import { Conversation } from "@/types/conversation";
+import { takeOverConversation } from "@/lib/conversation/actions";
+
+const RECOMMEND_LABEL: Record<string, string> = {
+  recover: "Recommended: Recover",
+  take_over: "Recommended: Take over",
+  no_action: "Recommended: No action needed",
+  book: "Recommended: Book",
+};
+
+/**
+ * Region B — explains why this conversation is surfaced and offers a
+ * single primary action, per spec §11, §22, §80–83. Never shows a
+ * confidence percentage.
+ */
+export function OpportunityBanner({
+  conversation,
+  onRecover,
+  onBook,
+}: {
+  conversation: Conversation;
+  onRecover: () => void;
+  onBook: () => void;
+}) {
+  const [takingOver, setTakingOver] = useState(false);
+
+  if (conversation.isClosed) {
+    return (
+      <div className="border-b border-slate-200 bg-slate-50 px-4 py-3">
+        <p className="text-sm font-medium text-slate-700">
+          {conversation.status === "lost" ? "Closed" : "This customer has been handled."}
+        </p>
+        {conversation.closedReason && (
+          <p className="mt-0.5 text-sm text-slate-500">{conversation.closedReason}</p>
+        )}
+      </div>
+    );
+  }
+
+  if (!conversation.whyHere && conversation.status !== "needs_attention") {
+    return null;
+  }
+
+  async function handleTakeOver() {
+    setTakingOver(true);
+    try {
+      await takeOverConversation(conversation.id);
+    } finally {
+      setTakingOver(false);
+    }
+  }
+
+  const rec = conversation.recommendedAction;
+
+  return (
+    <div
+      className={`border-b px-4 py-3 ${
+        conversation.status === "needs_attention"
+          ? "border-amber-200 bg-amber-50"
+          : "border-slate-200 bg-slate-50"
+      }`}
+    >
+      {conversation.whyHere && (
+        <p className="text-sm text-slate-700">{conversation.whyHere}</p>
+      )}
+
+      {rec && (
+        <p className="mt-1.5 text-xs font-medium uppercase tracking-wide text-slate-500">
+          {RECOMMEND_LABEL[rec.action] ?? ""}
+        </p>
+      )}
+
+      <div className="mt-2 flex flex-wrap gap-2">
+        {rec?.action === "recover" && (
+          <button
+            onClick={onRecover}
+            className="rounded-lg bg-slate-900 px-3.5 py-1.5 text-sm font-medium text-white hover:bg-slate-800"
+          >
+            Recover
+          </button>
+        )}
+        {rec?.action === "book" && (
+          <button
+            onClick={onBook}
+            className="rounded-lg bg-slate-900 px-3.5 py-1.5 text-sm font-medium text-white hover:bg-slate-800"
+          >
+            Book
+          </button>
+        )}
+        {conversation.ownershipMode !== "OWNER" && (
+          <button
+            onClick={handleTakeOver}
+            disabled={takingOver}
+            className="rounded-lg border border-slate-300 bg-white px-3.5 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-60"
+          >
+            {takingOver ? "Taking over…" : "Handle myself"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+---
+
+## 14. `components/conversation/ConversationSummary.tsx`
+
+```tsx
+// components/conversation/ConversationSummary.tsx
+
+"use client";
+
+import { useState } from "react";
+import { ChevronDown, ChevronUp } from "lucide-react";
+
+export function ConversationSummary({ summary }: { summary: string }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!summary) return null;
+
+  return (
+    <div className="border-b border-slate-100 px-4 py-2 sm:hidden">
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 text-left"
+      >
+        <p className={`text-sm text-slate-600 ${expanded ? "" : "line-clamp-1"}`}>
+          {summary}
+        </p>
+        {expanded ? (
+          <ChevronUp size={16} className="shrink-0 text-slate-400" />
+        ) : (
+          <ChevronDown size={16} className="shrink-0 text-slate-400" />
+        )}
+      </button>
+    </div>
+  );
+}
+```
+
+---
+
+## 15. `components/conversation/timeline/DateSeparator.tsx`
+
+```tsx
+// components/conversation/timeline/DateSeparator.tsx
+
+export function DateSeparator({ label }: { label: string }) {
+  return (
+    <div className="my-4 flex items-center justify-center" role="separator" aria-label={label}>
+      <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-500">
+        {label}
+      </span>
+    </div>
+  );
+}
+```
+
+---
+
+## 16. `components/conversation/timeline/SystemEventRow.tsx`
+
+```tsx
+// components/conversation/timeline/SystemEventRow.tsx
+
+import { SystemEvent } from "@/types/conversation";
+import { formatTimelineTimestamp } from "@/lib/format/time";
+
+/**
+ * Timeline milestones (spec §14–17, §38): not chat bubbles, rendered as
+ * a centered inline record. Covers missed calls, bookings, takeovers,
+ * recovery state changes, and closures.
+ */
+export function SystemEventRow({ event }: { event: SystemEvent }) {
+  return (
+    <div className="my-2 flex items-center justify-center gap-2" role="status">
+      <span
+        className="sr-only"
+      >{`${event.label}, ${formatTimelineTimestamp(event.timestamp)}`}</span>
+      <span
+        aria-hidden="true"
+        className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500"
+      >
+        {event.label} · {formatTimelineTimestamp(event.timestamp)}
+      </span>
+    </div>
+  );
+}
+```
+
+---
+
+## 17. `components/conversation/timeline/MessageBubble.tsx`
+
+```tsx
+// components/conversation/timeline/MessageBubble.tsx
+
+"use client";
+
+import { ConversationMessage } from "@/types/conversation";
+import { formatTimelineTimestamp } from "@/lib/format/time";
+import { AttachmentView } from "./AttachmentView";
+import { retryFailedMessage } from "@/lib/conversation/actions";
+
+/**
+ * A single conversational turn. AI-transparency requirement (spec §19–20,
+ * §110–112) is non-negotiable: Isolynic messages always carry a visible
+ * label; owner messages never carry AI branding.
+ */
+export function MessageBubble({ message }: { message: ConversationMessage }) {
+  const isCustomer = message.senderType === "CUSTOMER";
+  const isOwner = message.senderType === "OWNER";
+  const isIsolynic = message.senderType === "ISOLYNIC";
+
+  const align = isCustomer ? "items-start" : "items-end";
+  const bubbleStyle = isCustomer
+    ? "bg-slate-100 text-slate-900"
+    : isIsolynic
+    ? "bg-indigo-50 text-slate-900 border border-indigo-100"
+    : "bg-slate-900 text-white";
+
+  const senderLabel = isCustomer ? undefined : isOwner ? "You" : "Isolynic";
+
+  const screenReaderPrefix = isCustomer
+    ? "Customer"
+    : isOwner
+    ? "You"
+    : "Isolynic";
+
+  return (
+    <div className={`flex flex-col ${align} gap-1 px-4 py-1`}>
+      <div
+        className="max-w-[85%] sm:max-w-[70%]"
+        aria-label={`${screenReaderPrefix}, ${formatTimelineTimestamp(
+          message.timestamp
+        )}: ${message.body}`}
+      >
+        {senderLabel && (
+          <div className="mb-0.5 flex items-center gap-1.5 px-1 text-xs font-medium text-slate-500">
+            {senderLabel}
+            {message.isAutomaticFollowUp && (
+              <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-normal text-slate-500">
+                Automatic follow-up
+              </span>
+            )}
+          </div>
+        )}
+
+        <div className={`rounded-2xl px-3.5 py-2.5 text-[15px] leading-relaxed ${bubbleStyle}`}>
+          {message.body && <p className="whitespace-pre-wrap">{message.body}</p>}
+          {message.attachments?.map((att) => (
+            <AttachmentView key={att.id} attachment={att} />
+          ))}
+        </div>
+
+        <div className="mt-0.5 flex items-center gap-2 px-1">
+          <span className="text-[11px] text-slate-400">
+            {formatTimelineTimestamp(message.timestamp)}
+          </span>
+          {isOwner && message.deliveryStatus && (
+            <DeliveryStatusLabel
+              status={message.deliveryStatus}
+              onRetry={() =>
+                retryFailedMessage(message.conversationId, message.id)
+              }
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DeliveryStatusLabel({
+  status,
+  onRetry,
+}: {
+  status: NonNullable<ConversationMessage["deliveryStatus"]>;
+  onRetry: () => void;
+}) {
+  if (status === "failed") {
+    return (
+      <span className="text-[11px] text-red-600">
+        Couldn&apos;t send ·{" "}
+        <button onClick={onRetry} className="underline">
+          Try again
+        </button>
+      </span>
+    );
+  }
+  const label =
+    status === "sending"
+      ? "Sending…"
+      : status === "sent"
+      ? "Sent"
+      : status === "delivered"
+      ? "Delivered"
+      : "Read";
+  return <span className="text-[11px] text-slate-400">{label}</span>;
+}
+```
+
+---
+
+## 18. `components/conversation/timeline/AttachmentView.tsx`
+
+```tsx
+// components/conversation/timeline/AttachmentView.tsx
+
+"use client";
+
+import { useState } from "react";
+import { Play, Pause, Download, ImageOff } from "lucide-react";
+import { MessageAttachment } from "@/types/conversation";
+
+export function AttachmentView({ attachment }: { attachment: MessageAttachment }) {
+  if (attachment.type === "image") return <ImageAttachment attachment={attachment} />;
+  if (attachment.type === "audio") return <AudioAttachment attachment={attachment} />;
+  return <DocumentAttachment attachment={attachment} />;
+}
+
+function ImageAttachment({ attachment }: { attachment: MessageAttachment }) {
+  const [loaded, setLoaded] = useState(false);
+  const [errored, setErrored] = useState(false);
+
+  return (
+    <div className="mt-2">
+      <div className="relative overflow-hidden rounded-lg bg-slate-200">
+        {!loaded && !errored && (
+          <div className="flex h-40 w-56 animate-pulse items-center justify-center text-xs text-slate-400">
+            Loading attachment…
+          </div>
+        )}
+        {errored ? (
+          <div className="flex h-40 w-56 flex-col items-center justify-center gap-1 text-slate-400">
+            <ImageOff size={20} />
+            <span className="text-xs">Couldn&apos;t load image</span>
+          </div>
+        ) : (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={attachment.url}
+            alt={attachment.aiCaption ?? "Customer attachment"}
+            loading="lazy"
+            onLoad={() => setLoaded(true)}
+            onError={() => setErrored(true)}
+            className={`max-h-72 max-w-full object-cover ${loaded ? "block" : "hidden"}`}
+          />
+        )}
+      </div>
+      {attachment.aiCaption && (
+        <p className="mt-1 text-xs italic text-slate-500">{attachment.aiCaption}</p>
+      )}
+    </div>
+  );
+}
+
+function AudioAttachment({ attachment }: { attachment: MessageAttachment }) {
+  const [playing, setPlaying] = useState(false);
+  const duration = attachment.durationSeconds ?? 0;
+  const mm = Math.floor(duration / 60);
+  const ss = String(Math.floor(duration % 60)).padStart(2, "0");
+
+  return (
+    <div className="mt-2 rounded-lg bg-white/60 p-2.5">
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => setPlaying((v) => !v)}
+          aria-label={playing ? "Pause voice message" : "Play voice message"}
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-slate-900 text-white"
+        >
+          {playing ? <Pause size={14} /> : <Play size={14} className="ml-0.5" />}
+        </button>
+        <span className="text-xs text-slate-500">
+          Voice message — {mm}:{ss}
+        </span>
+        <audio
+          src={attachment.url}
+          className="hidden"
+          onEnded={() => setPlaying(false)}
+        />
+      </div>
+      {attachment.transcript && (
+        <p className="mt-1.5 text-xs text-slate-500">
+          Summary: {attachment.transcript}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function DocumentAttachment({ attachment }: { attachment: MessageAttachment }) {
+  return (
+    <a
+      href={attachment.url}
+      target="_blank"
+      rel="noreferrer"
+      className="mt-2 flex items-center gap-2 rounded-lg bg-white/60 p-2.5 text-xs text-slate-600 hover:bg-white"
+    >
+      <Download size={14} />
+      Document attachment
+    </a>
+  );
+}
+```
+
+---
+
+## 19. `components/conversation/ConversationTimeline.tsx`
+
+```tsx
+// components/conversation/ConversationTimeline.tsx
+
+"use client";
+
+import { useEffect, useRef } from "react";
+import { TimelineItem } from "@/types/conversation";
+import { dayKey, formatDaySeparator } from "@/lib/format/time";
+import { DateSeparator } from "./timeline/DateSeparator";
+import { SystemEventRow } from "./timeline/SystemEventRow";
+import { MessageBubble } from "./timeline/MessageBubble";
+
+type Props = {
+  items: TimelineItem[];
+  loading: boolean;
+  loadingMore: boolean;
+  hasMore: boolean;
+  onLoadOlder: () => void;
+};
+
+/**
+ * Region C. Groups messages by day (spec §17), distinguishes four event
+ * types, and supports upward pagination without an infinite in-memory
+ * conversation (spec §58).
+ */
+export function ConversationTimeline({
+  items,
+  loading,
+  loadingMore,
+  hasMore,
+  onLoadOlder,
+}: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const didInitialScroll = useRef(false);
+
+  // Scroll to latest on first load (spec §57).
+  useEffect(() => {
+    if (!loading && !didInitialScroll.current && items.length > 0) {
+      bottomRef.current?.scrollIntoView({ block: "end" });
+      didInitialScroll.current = true;
+    }
+  }, [loading, items.length]);
+
+  // Infinite-upward pagination.
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    const container = containerRef.current;
+    if (!sentinel || !container || !hasMore) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && !loadingMore) {
+          const prevHeight = container.scrollHeight;
+          onLoadOlder();
+          // Preserve scroll position after older items are prepended.
+          requestAnimationFrame(() => {
+            const newHeight = container.scrollHeight;
+            container.scrollTop += newHeight - prevHeight;
+          });
+        }
+      },
+      { root: container, threshold: 0.1 }
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [hasMore, loadingMore, onLoadOlder]);
+
+  if (loading) {
+    return <TimelineSkeleton />;
+  }
+
+  if (items.length === 0) {
+    return <EmptyTimeline />;
+  }
+
+  let lastDayKey: string | null = null;
+
+  return (
+    <div
+      ref={containerRef}
+      className="flex-1 overflow-y-auto py-3"
+      aria-label="Conversation timeline"
+      aria-live="polite"
+    >
+      <div ref={sentinelRef} />
+      {loadingMore && (
+        <p className="py-2 text-center text-xs text-slate-400">Loading earlier messages…</p>
+      )}
+
+      {items.map((item) => {
+        const ts = item.kind === "message" ? item.data.timestamp : item.data.timestamp;
+        const key = dayKey(ts);
+        const showSeparator = key !== lastDayKey;
+        lastDayKey = key;
+
+        return (
+          <div key={item.data.id}>
+            {showSeparator && <DateSeparator label={formatDaySeparator(ts)} />}
+            {item.kind === "system_event" ? (
+              <SystemEventRow event={item.data} />
+            ) : (
+              <MessageBubble message={item.data} />
+            )}
+          </div>
+        );
+      })}
+
+      <div ref={bottomRef} />
+    </div>
+  );
+}
+
+function TimelineSkeleton() {
+  return (
+    <div className="flex-1 space-y-3 overflow-hidden px-4 py-4">
+      {[0, 1, 2, 3].map((i) => (
+        <div
+          key={i}
+          className={`h-12 w-2/3 animate-pulse rounded-2xl bg-slate-100 ${
+            i % 2 === 0 ? "mr-auto" : "ml-auto"
+          }`}
+        />
+      ))}
+    </div>
+  );
+}
+
+function EmptyTimeline() {
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center gap-1 px-6 text-center">
+      <p className="text-sm font-medium text-slate-600">No messages yet</p>
+      <p className="text-sm text-slate-400">This customer has not sent a message yet.</p>
+    </div>
+  );
+}
+```
+
+---
+
+## 20. `components/conversation/Composer.tsx`
+
+```tsx
+// components/conversation/Composer.tsx
+
+"use client";
+
+import { useState, useRef, useEffect } from "react";
+import { Send, Phone, UserCheck } from "lucide-react";
+import { Conversation } from "@/types/conversation";
+import {
+  sendOwnerMessage,
+  requestReplySuggestion,
+  takeOverConversation,
+} from "@/lib/conversation/actions";
+
+type Props = {
+  conversation: Conversation;
+  isOnline: boolean;
+  onCall: () => void;
+  onBook?: () => void;
+};
+
+/**
+ * Region E. Deliberately minimal: no prompt controls, no tone/model
+ * selectors (spec §24). The one AI-assisted affordance is a single
+ * optional suggested reply that never auto-sends (spec §25).
+ */
+export function Composer({ conversation, isOnline, onCall }: Props) {
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [suggestion, setSuggestion] = useState<string | null>(null);
+  const [suggestionLoading, setSuggestionLoading] = useState(false);
+  const [takingOver, setTakingOver] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const hasFocusedOnce = useRef(false);
+
+  const isOwnerHandling = conversation.ownershipMode === "OWNER";
+
+  async function handleFocus() {
+    if (hasFocusedOnce.current || !isOwnerHandling || text.trim()) return;
+    hasFocusedOnce.current = true;
+    setSuggestionLoading(true);
+    try {
+      const s = await requestReplySuggestion(conversation.id);
+      setSuggestion(s);
+    } catch {
+      setSuggestion(null);
+    } finally {
+      setSuggestionLoading(false);
+    }
+  }
+
+  async function handleSend() {
+    const body = text.trim();
+    if (!body || sending || !isOnline) return;
+    setSending(true);
+    setText("");
+    setSuggestion(null);
+    try {
+      await sendOwnerMessage(conversation.id, body);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  }
+
+  async function handleTakeOver() {
+    setTakingOver(true);
+    try {
+      await takeOverConversation(conversation.id);
+    } finally {
+      setTakingOver(false);
+    }
+  }
+
+  // Keep composer visible above mobile keyboard (spec §85).
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const handler = () => {
+      document.documentElement.style.setProperty("--vv-offset", `${window.innerHeight - vv.height}px`);
+    };
+    vv.addEventListener("resize", handler);
+    return () => vv.removeEventListener("resize", handler);
+  }, []);
+
+  return (
+    <div
+      className="border-t border-slate-200 bg-white px-3 py-2.5"
+      style={{ paddingBottom: "max(env(safe-area-inset-bottom), 10px)" }}
+    >
+      {!isOnline && (
+        <div className="mb-2 rounded-lg bg-slate-100 px-3 py-1.5 text-xs text-slate-500">
+          You&apos;re offline. Messages can&apos;t be sent right now.
+        </div>
+      )}
+
+      {suggestionLoading && (
+        <div className="mb-2 rounded-lg border border-slate-200 px-3 py-2 text-xs text-slate-400">
+          Preparing a suggested reply…
+        </div>
+      )}
+
+      {suggestion && !text && (
+        <div className="mb-2 rounded-lg border border-indigo-100 bg-indigo-50 px-3 py-2">
+          <p className="text-xs font-medium text-indigo-600">Suggested reply</p>
+          <p className="mt-0.5 text-sm text-slate-700">{suggestion}</p>
+          <div className="mt-1.5 flex gap-3">
+            <button
+              onClick={() => {
+                setText(suggestion);
+                setSuggestion(null);
+                textareaRef.current?.focus();
+              }}
+              className="text-xs font-medium text-indigo-600 hover:underline"
+            >
+              Use
+            </button>
+            <button
+              onClick={() => setSuggestion(null)}
+              className="text-xs font-medium text-slate-500 hover:underline"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="flex items-end gap-2">
+        <textarea
+          ref={textareaRef}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onFocus={handleFocus}
+          onKeyDown={handleKeyDown}
+          disabled={!isOnline || sending}
+          placeholder="Write a message…"
+          rows={1}
+          className="max-h-32 flex-1 resize-none rounded-2xl border border-slate-300 bg-white px-3.5 py-2.5 text-[15px] text-slate-900 placeholder:text-slate-400 focus:border-slate-400 focus:outline-none disabled:bg-slate-50"
+        />
+
+        <button
+          onClick={onCall}
+          aria-label="Call customer"
+          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-slate-300 text-slate-600 hover:bg-slate-100"
+        >
+          <Phone size={18} />
+        </button>
+
+        {isOwnerHandling ? (
+          <button
+            onClick={handleSend}
+            disabled={!text.trim() || sending || !isOnline}
+            aria-label="Send message"
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-40"
+          >
+            <Send size={17} />
+          </button>
+        ) : (
+          <button
+            onClick={handleTakeOver}
+            disabled={takingOver}
+            aria-label="Take over conversation"
+            className="flex h-10 shrink-0 items-center gap-1.5 rounded-full bg-slate-900 px-3.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-60"
+          >
+            <UserCheck size={16} />
+            {takingOver ? "…" : "Take over"}
+          </button>
+        )}
+      </div>
+
+      {isOwnerHandling && (
+        <p className="mt-1.5 px-1 text-xs text-slate-400">
+          You&apos;re in control now. Isolynic won&apos;t message this customer until you turn it
+          back on.{" "}
+          <ReleaseControlLink conversationId={conversation.id} />
+        </p>
+      )}
+    </div>
+  );
+}
+
+function ReleaseControlLink({ conversationId }: { conversationId: string }) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <button
+      disabled={busy}
+      onClick={async () => {
+        setBusy(true);
+        const { releaseConversationToIsolynic } = await import("@/lib/conversation/actions");
+        try {
+          await releaseConversationToIsolynic(conversationId);
+        } finally {
+          setBusy(false);
+        }
+      }}
+      className="font-medium text-slate-600 underline"
+    >
+      Let Isolynic handle it again
+    </button>
+  );
+}
+```
+
+---
+
+## 21. `components/conversation/CustomerContextPanel.tsx`
+
+```tsx
+// components/conversation/CustomerContextPanel.tsx
+
+"use client";
+
+import { useState } from "react";
+import { Conversation, Customer } from "@/types/conversation";
+import { addPrivateNote } from "@/lib/conversation/actions";
+
+/**
+ * Region F. Deliberately minimal — "what do I need to know to handle this
+ * customer", not a full CRM record (spec §31–32).
+ */
+export function CustomerContextPanel({
+  conversation,
+  customer,
+  onCall,
+  onBook,
+}: {
+  conversation: Conversation;
+  customer: Customer | null;
+  onCall: () => void;
+  onBook: () => void;
+}) {
+  const [note, setNote] = useState("");
+  const [savingNote, setSavingNote] = useState(false);
+
+  async function handleSaveNote() {
+    const body = note.trim();
+    if (!body) return;
+    setSavingNote(true);
+    try {
+      await addPrivateNote(conversation.id, body);
+      setNote("");
+    } finally {
+      setSavingNote(false);
+    }
+  }
+
+  return (
+    <aside className="flex h-full flex-col overflow-y-auto border-l border-slate-200 bg-white px-4 py-4">
+      <Section title="Customer">
+        <p className="text-sm font-medium text-slate-900">{customer?.name ?? "Unknown"}</p>
+        {customer?.phone && <p className="text-sm text-slate-500">{customer.phone}</p>}
+        {customer?.preferredChannel && (
+          <p className="mt-0.5 text-xs text-slate-400 capitalize">
+            Prefers {customer.preferredChannel}
+          </p>
+        )}
+      </Section>
+
+      <Section title="What they want">
+        <p className="text-sm text-slate-600">{conversation.summary || "No summary yet."}</p>
+      </Section>
+
+      <Section title="Opportunity">
+        <p className="text-sm text-slate-600 capitalize">
+          {conversation.status.replace(/_/g, " ")}
+        </p>
+      </Section>
+
+      {conversation.currentBooking && (
+        <Section title="Booking">
+          <p className="text-sm text-slate-600">
+            {conversation.currentBooking.startTime.toDate().toLocaleString(undefined, {
+              weekday: "short",
+              month: "short",
+              day: "numeric",
+              hour: "numeric",
+              minute: "2-digit",
+            })}{" "}
+            ({conversation.currentBooking.timezone})
+          </p>
+          <p className="mt-0.5 text-xs capitalize text-slate-400">
+            {conversation.currentBooking.status}
+          </p>
+        </Section>
+      )}
+
+      <Section title="Actions">
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={onCall}
+            className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+          >
+            Call
+          </button>
+          <button
+            onClick={onBook}
+            className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+          >
+            Book
+          </button>
+        </div>
+      </Section>
+
+      <Section title="Private notes">
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="Add a note only you can see…"
+          rows={2}
+          className="w-full resize-none rounded-lg border border-slate-200 px-2.5 py-2 text-sm placeholder:text-slate-400 focus:border-slate-400 focus:outline-none"
+        />
+        <button
+          onClick={handleSaveNote}
+          disabled={!note.trim() || savingNote}
+          className="mt-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40"
+        >
+          {savingNote ? "Saving…" : "Add note"}
+        </button>
+      </Section>
+    </aside>
+  );
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="mb-5 border-b border-slate-100 pb-4 last:border-0">
+      <h3 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-slate-400">
+        {title}
+      </h3>
+      {children}
+    </div>
+  );
+}
+```
+
+---
+
+## 22. `components/conversation/BookingSheet.tsx`
+
+```tsx
+// components/conversation/BookingSheet.tsx
+
+"use client";
+
+import { useEffect, useState } from "react";
+import { X } from "lucide-react";
+import { getAvailableSlots, createBooking } from "@/lib/conversation/actions";
+
+type Slot = { startIso: string; endIso: string };
+
+function nextNDays(n: number): Date[] {
+  const days: Date[] = [];
+  const today = new Date();
+  for (let i = 0; i < n; i++) {
+    const d = new Date(today);
+    d.setDate(today.getDate() + i);
+    days.push(d);
+  }
+  return days;
+}
+
+/**
+ * Booking flow (spec §30): pick a day, then a slot, create on the
+ * connected calendar via Cloud Function → Google Calendar events.insert.
+ */
+export function BookingSheet({
+  conversationId,
+  onClose,
+  onBooked,
+}: {
+  conversationId: string;
+  onClose: () => void;
+  onBooked: () => void;
+}) {
+  const days = nextNDays(5);
+  const [selectedDay, setSelectedDay] = useState<Date>(days[0]);
+  const [slots, setSlots] = useState<Slot[]>([]);
+  const [loadingSlots, setLoadingSlots] = useState(true);
+  const [booking, setBooking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingSlots(true);
+    setError(null);
+    getAvailableSlots(conversationId, selectedDay.toISOString())
+      .then((s) => {
+        if (!cancelled) setSlots(s);
+      })
+      .catch(() => {
+        if (!cancelled) setError("Couldn't load availability. Try again.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingSlots(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, selectedDay]);
+
+  async function handleBook(slot: Slot) {
+    setBooking(true);
+    setError(null);
+    try {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      await createBooking(conversationId, slot.startIso, slot.endIso, tz);
+      onBooked();
+      onClose();
+    } catch {
+      setError("Couldn't complete the booking. Try again.");
+    } finally {
+      setBooking(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 sm:items-center">
+      <div className="flex max-h-[85vh] w-full max-w-md flex-col rounded-t-2xl bg-white sm:rounded-2xl">
+        <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
+          <h2 className="text-base font-semibold text-slate-900">Book appointment</h2>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="flex h-8 w-8 items-center justify-center rounded-full hover:bg-slate-100"
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="flex gap-2 overflow-x-auto border-b border-slate-100 px-4 py-3">
+          {days.map((d) => {
+            const isSelected = d.toDateString() === selectedDay.toDateString();
+            const label =
+              d.toDateString() === new Date().toDateString()
+                ? "Today"
+                : d.toLocaleDateString(undefined, { weekday: "short", day: "numeric" });
+            return (
+              <button
+                key={d.toISOString()}
+                onClick={() => setSelectedDay(d)}
+                className={`shrink-0 rounded-full px-3.5 py-1.5 text-sm font-medium ${
+                  isSelected
+                    ? "bg-slate-900 text-white"
+                    : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                }`}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-4 py-3">
+          {error && <p className="mb-2 text-sm text-red-600">{error}</p>}
+          {loadingSlots ? (
+            <div className="grid grid-cols-3 gap-2">
+              {Array.from({ length: 6 }).map((_, i) => (
+                <div key={i} className="h-9 animate-pulse rounded-lg bg-slate-100" />
+              ))}
+            </div>
+          ) : slots.length === 0 ? (
+            <p className="py-6 text-center text-sm text-slate-400">
+              No available times on this day.
+            </p>
+          ) : (
+            <div className="grid grid-cols-3 gap-2">
+              {slots.map((slot) => (
+                <button
+                  key={slot.startIso}
+                  disabled={booking}
+                  onClick={() => handleBook(slot)}
+                  className="rounded-lg border border-slate-200 py-2 text-sm font-medium text-slate-700 hover:border-slate-900 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  {new Date(slot.startIso).toLocaleTimeString(undefined, {
+                    hour: "numeric",
+                    minute: "2-digit",
+                  })}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+---
+
+## 23. `components/conversation/IdentityConflictBanner.tsx`
+
+```tsx
+// components/conversation/IdentityConflictBanner.tsx
+
+"use client";
+
+import { useState } from "react";
+import { Customer } from "@/types/conversation";
+import { resolveIdentityMatch } from "@/lib/conversation/actions";
+
+export function IdentityConflictBanner({
+  conversationId,
+  customer,
+}: {
+  conversationId: string;
+  customer: Customer;
+}) {
+  const [resolved, setResolved] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  if (customer.identityConfidence !== "possible_match" || resolved) return null;
+
+  async function resolve(decision: "merge" | "keep_separate") {
+    setBusy(true);
+    try {
+      await resolveIdentityMatch(conversationId, decision);
+      setResolved(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="border-b border-slate-200 bg-slate-50 px-4 py-2.5">
+      <p className="text-sm text-slate-700">
+        We couldn&apos;t confirm this customer&apos;s identity.
+      </p>
+      <div className="mt-1.5 flex gap-2">
+        <button
+          disabled={busy}
+          onClick={() => resolve("merge")}
+          className="rounded-lg border border-slate-300 bg-white px-3 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100"
+        >
+          Same customer
+        </button>
+        <button
+          disabled={busy}
+          onClick={() => resolve("keep_separate")}
+          className="rounded-lg border border-slate-300 bg-white px-3 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100"
+        >
+          Different customer
+        </button>
+      </div>
+    </div>
+  );
+}
+```
+
+---
+
+## 24. `app/conversations/[id]/page.tsx` — main screen
+
+```tsx
+// app/conversations/[id]/page.tsx
+
+"use client";
+
+import { useState, useCallback } from "react";
+import { useParams, useRouter } from "next/navigation";
+
+import { useConversation } from "@/hooks/useConversation";
+import { useConversationTimeline } from "@/hooks/useConversationTimeline";
+import { useCustomer } from "@/hooks/useCustomer";
+import { useConnectionStatus } from "@/hooks/useConnectionStatus";
+
+import { ConversationHeader } from "@/components/conversation/ConversationHeader";
+import { OpportunityBanner } from "@/components/conversation/OpportunityBanner";
+import { ConversationSummary } from "@/components/conversation/ConversationSummary";
+import { ConversationTimeline } from "@/components/conversation/ConversationTimeline";
+import { Composer } from "@/components/conversation/Composer";
+import { CustomerContextPanel } from "@/components/conversation/CustomerContextPanel";
+import { BookingSheet } from "@/components/conversation/BookingSheet";
+import { IdentityConflictBanner } from "@/components/conversation/IdentityConflictBanner";
+
+export default function ConversationPage() {
+  const params = useParams<{ id: string }>();
+  const router = useRouter();
+  const conversationId = params?.id ?? null;
+
+  const { conversation, loading: convoLoading } = useConversation(conversationId);
+  const { customer } = useCustomer(conversation?.customerId ?? null);
+  const timeline = useConversationTimeline(conversationId);
+  const { isOnline, justReconnected } = useConnectionStatus();
+
+  const [bookingOpen, setBookingOpen] = useState(false);
+
+  const handleBack = useCallback(() => router.back(), [router]);
+
+  const handleCall = useCallback(() => {
+    if (!customer?.phone) return;
+    window.location.href = `tel:${customer.phone}`;
+  }, [customer]);
+
+  const handleRecover = useCallback(async () => {
+    if (!conversationId) return;
+    const { requestReplySuggestion, sendOwnerMessage } = await import(
+      "@/lib/conversation/actions"
+    );
+    // "Recover" surfaces a suggested follow-up for the owner to review/send —
+    // it never sends on its own (spec §25, §82: every recommendation is optional).
+    const suggestion = await requestReplySuggestion(conversationId);
+    if (suggestion) {
+      const confirmed = window.confirm(`Send this follow-up?\n\n${suggestion}`);
+      if (confirmed) await sendOwnerMessage(conversationId, suggestion);
+    }
+  }, [conversationId]);
+
+  if (convoLoading) {
+    return <PageSkeleton />;
+  }
+
+  if (!conversation) {
+    return (
+      <div className="flex h-dvh flex-col items-center justify-center gap-2 px-6 text-center">
+        <p className="text-sm font-medium text-slate-600">This conversation isn&apos;t available.</p>
+        <button onClick={handleBack} className="text-sm text-indigo-600 underline">
+          Go back
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-dvh flex-col bg-white sm:flex-row">
+      <div className="flex min-w-0 flex-1 flex-col sm:basis-[68%]">
+        <ConversationHeader conversation={conversation} customer={customer} onBack={handleBack} />
+
+        {justReconnected && (
+          <div className="bg-emerald-50 px-4 py-1.5 text-center text-xs text-emerald-700">
+            You&apos;re back online.
+          </div>
+        )}
+
+        {customer && (
+          <IdentityConflictBanner conversationId={conversation.id} customer={customer} />
+        )}
+
+        <OpportunityBanner
+          conversation={conversation}
+          onRecover={handleRecover}
+          onBook={() => setBookingOpen(true)}
+        />
+
+        <ConversationSummary summary={conversation.summary} />
+
+        <ConversationTimeline
+          items={timeline.items}
+          loading={timeline.loading}
+          loadingMore={timeline.loadingMore}
+          hasMore={timeline.hasMore}
+          onLoadOlder={timeline.loadOlder}
+        />
+
+        {!conversation.isClosed && (
+          <Composer
+            conversation={conversation}
+            isOnline={isOnline}
+            onCall={handleCall}
+            onBook={() => setBookingOpen(true)}
+          />
+        )}
+      </div>
+
+      <div className="hidden sm:block sm:w-[32%] sm:max-w-sm">
+        <CustomerContextPanel
+          conversation={conversation}
+          customer={customer}
+          onCall={handleCall}
+          onBook={() => setBookingOpen(true)}
+        />
+      </div>
+
+      {bookingOpen && (
+        <BookingSheet
+          conversationId={conversation.id}
+          onClose={() => setBookingOpen(false)}
+          onBooked={() => setBookingOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function PageSkeleton() {
+  return (
+    <div className="flex h-dvh flex-col">
+      <div className="flex items-center gap-3 border-b border-slate-200 px-4 py-3">
+        <div className="h-9 w-9 animate-pulse rounded-full bg-slate-100" />
+        <div className="flex-1 space-y-1.5">
+          <div className="h-4 w-32 animate-pulse rounded bg-slate-100" />
+          <div className="h-3 w-20 animate-pulse rounded bg-slate-100" />
+        </div>
+      </div>
+      <div className="flex-1 space-y-3 px-4 py-4">
+        {[0, 1, 2].map((i) => (
+          <div
+            key={i}
+            className={`h-12 w-2/3 animate-pulse rounded-2xl bg-slate-100 ${
+              i % 2 ? "ml-auto" : ""
+            }`}
+          />
+        ))}
+      </div>
+      <div className="h-16 border-t border-slate-200" />
+    </div>
+  );
+}
+```
+
+---
+
+## 25. Firestore Security Rules (relevant excerpt) — `firestore.rules`
+
+```
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function belongsToBusiness(businessId) {
+      return isSignedIn() &&
+        request.auth.token.businessId == businessId;
+    }
+
+    match /conversations/{conversationId} {
+      allow read: if belongsToBusiness(resource.data.businessId);
+      // All writes to conversation state (status, ownershipMode, summary,
+      // recommendedAction, currentBooking) happen server-side only, per
+      // spec §105 — the client never mutates authorization/state directly.
+      allow write: if false;
+
+      match /timeline/{itemId} {
+        allow read: if belongsToBusiness(get(/databases/$(database)/documents/conversations/$(conversationId)).data.businessId);
+        allow write: if false;
+      }
+
+      match /notes/{noteId} {
+        allow read: if belongsToBusiness(get(/databases/$(database)/documents/conversations/$(conversationId)).data.businessId);
+        allow write: if false;
+      }
+    }
+
+    match /customers/{customerId} {
+      allow read: if belongsToBusiness(resource.data.businessId);
+      allow write: if false;
+    }
+  }
+}
+```
+
+---
+
+## 26. Cloud Functions v2 — `functions/src/conversation/types.ts`
+
+```typescript
+// functions/src/conversation/types.ts
+
+import { Timestamp } from "firebase-admin/firestore";
+
+export type Channel = "whatsapp" | "phone" | "website" | "sms";
+export type SenderType = "CUSTOMER" | "ISOLYNIC" | "OWNER" | "SYSTEM";
+export type OwnershipMode = "ISOLYNIC" | "OWNER" | "WAITING";
+export type OpportunityStatus =
+  | "active"
+  | "isolynic_handling"
+  | "waiting_for_customer"
+  | "needs_attention"
+  | "booked"
+  | "recovered"
+  | "lost";
+
+export interface ConversationDoc {
+  businessId: string;
+  customerId: string;
+  opportunityId: string;
+  channel: Channel;
+  status: OpportunityStatus;
+  ownershipMode: OwnershipMode;
+  summary: string;
+  whyHere: string | null;
+  recommendedAction: { action: string; reason: string } | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  lastCustomerActivity: Timestamp | null;
+  lastOwnerActivity: Timestamp | null;
+  lastIsolynicActivity: Timestamp | null;
+  currentBooking: Record<string, unknown> | null;
+  isClosed: boolean;
+  closedReason?: string;
+}
+
+export interface TimelineMessageDoc {
+  _collectionType: "message";
+  conversationId: string;
+  senderType: SenderType;
+  channel: Channel;
+  body: string;
+  attachments: unknown[];
+  timestamp: Timestamp;
+  deliveryStatus?: string;
+  providerReference?: string;
+  isAutomaticFollowUp?: boolean;
+  isPrivateNote?: boolean;
+}
+
+export interface TimelineSystemEventDoc {
+  _collectionType: "system_event";
+  conversationId: string;
+  type: string;
+  label: string;
+  timestamp: Timestamp;
+  metadata?: Record<string, unknown>;
+}
+```
+
+---
+
+## 27. `functions/src/conversation/auth.ts`
+
+```typescript
+// functions/src/conversation/auth.ts
+
+import { HttpsError, CallableRequest } from "firebase-functions/v2/https";
+import { getFirestore } from "firebase-admin/firestore";
+
+const db = getFirestore();
+
+/**
+ * Server-side authorization boundary (spec §105): the client never decides
+ * conversation access — every callable re-verifies ownership here.
+ */
+export async function assertConversationAccess(
+  request: CallableRequest,
+  conversationId: string
+) {
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "Sign in required.");
+  }
+  const businessId = request.auth.token.businessId as string | undefined;
+  if (!businessId) {
+    throw new HttpsError("permission-denied", "No business associated with this account.");
+  }
+
+  const convoRef = db.collection("conversations").doc(conversationId);
+  const convoSnap = await convoRef.get();
+  if (!convoSnap.exists) {
+    throw new HttpsError("not-found", "Conversation not found.");
+  }
+  const data = convoSnap.data()!;
+  if (data.businessId !== businessId) {
+    throw new HttpsError("permission-denied", "You don't have access to this conversation.");
+  }
+
+  return { convoRef, data, uid: request.auth.uid, businessId };
+}
+```
+
+---
+
+## 28. `functions/src/conversation/callables.ts`
+
+```typescript
+// functions/src/conversation/callables.ts
+
+import { onCall, HttpsError } from "firebase-functions/v2/https";
+import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
+import { assertConversationAccess } from "./auth";
+import { sendOutboundMessage } from "./channelDispatch";
+import { generateReplySuggestion } from "./ai";
+import { findAvailableSlots, insertCalendarEvent } from "./calendar";
+import { logSecurityEvent } from "./audit";
+
+const db = getFirestore();
+
+/**
+ * Owner sends a manual message. Manual means manual (spec §48) — the body
+ * is sent verbatim, never rewritten by AI.
+ */
+export const sendOwnerMessage = onCall(async (request) => {
+  const { conversationId, body } = request.data as { conversationId: string; body: string };
+  if (!body || !body.trim()) {
+    throw new HttpsError("invalid-argument", "Message body is required.");
+  }
+  if (body.length > 4000) {
+    throw new HttpsError("invalid-argument", "Message is too long.");
+  }
+
+  const { convoRef, data, uid } = await assertConversationAccess(request, conversationId);
+
+  const timelineRef = convoRef.collection("timeline").doc();
+  const now = Timestamp.now();
+
+  await timelineRef.set({
+    _collectionType: "message",
+    conversationId,
+    senderType: "OWNER",
+    channel: data.channel,
+    body: body.trim(),
+    attachments: [],
+    timestamp: now,
+    deliveryStatus: "sending",
+    authorUid: uid,
+  });
+
+  await convoRef.update({
+    lastOwnerActivity: now,
+    updatedAt: now,
+  });
+
+  try {
+    const providerReference = await sendOutboundMessage({
+      businessId: data.businessId,
+      customerId: data.customerId,
+      channel: data.channel,
+      body: body.trim(),
+    });
+    await timelineRef.update({ deliveryStatus: "sent", providerReference });
+  } catch (err) {
+    await timelineRef.update({ deliveryStatus: "failed" });
+    throw new HttpsError("internal", "Couldn't send the message. Try again.");
+  }
+
+  return { success: true, messageId: timelineRef.id };
+});
+
+export const retryFailedMessage = onCall(async (request) => {
+  const { conversationId, messageId } = request.data as {
+    conversationId: string;
+    messageId: string;
+  };
+  const { convoRef, data } = await assertConversationAccess(request, conversationId);
+
+  const msgRef = convoRef.collection("timeline").doc(messageId);
+  const msgSnap = await msgRef.get();
+  if (!msgSnap.exists) throw new HttpsError("not-found", "Message not found.");
+  const msg = msgSnap.data()!;
+
+  if (msg.deliveryStatus !== "failed") {
+    throw new HttpsError("failed-precondition", "This message isn't in a failed state.");
+  }
+
+  await msgRef.update({ deliveryStatus: "sending" });
+  try {
+    const providerReference = await sendOutboundMessage({
+      businessId: data.businessId,
+      customerId: data.customerId,
+      channel: data.channel,
+      body: msg.body,
+    });
+    await msgRef.update({ deliveryStatus: "sent", providerReference });
+  } catch {
+    await msgRef.update({ deliveryStatus: "failed" });
+    throw new HttpsError("internal", "Couldn't send the message. Try again.");
+  }
+
+  return { success: true };
+});
+
+/**
+ * One tap, no confirmation friction (spec §26–27): stop autonomous
+ * handling immediately and hand control to the owner.
+ */
+export const takeOverConversation = onCall(async (request) => {
+  const { conversationId } = request.data as { conversationId: string };
+  const { convoRef, uid } = await assertConversationAccess(request, conversationId);
+
+  const now = Timestamp.now();
+  await convoRef.update({
+    ownershipMode: "OWNER",
+    updatedAt: now,
+  });
+
+  await convoRef.collection("timeline").add({
+    _collectionType: "system_event",
+    conversationId,
+    type: "owner_takeover",
+    label: "You took over this conversation",
+    timestamp: now,
+  });
+
+  await logSecurityEvent({ type: "owner_takeover", conversationId, uid });
+
+  return { success: true };
+});
+
+export const releaseConversationToIsolynic = onCall(async (request) => {
+  const { conversationId } = request.data as { conversationId: string };
+  const { convoRef, uid } = await assertConversationAccess(request, conversationId);
+
+  const now = Timestamp.now();
+  await convoRef.update({
+    ownershipMode: "ISOLYNIC",
+    updatedAt: now,
+  });
+
+  await convoRef.collection("timeline").add({
+    _collectionType: "system_event",
+    conversationId,
+    type: "owner_released",
+    label: "Isolynic is handling this conversation again",
+    timestamp: now,
+  });
+
+  await logSecurityEvent({ type: "owner_released", conversationId, uid });
+
+  return { success: true };
+});
+
+/**
+ * One suggested reply, contextual, never auto-sent (spec §25).
+ */
+export const suggestReply = onCall(async (request) => {
+  const { conversationId } = request.data as { conversationId: string };
+  const { data } = await assertConversationAccess(request, conversationId);
+
+  const suggestion = await generateReplySuggestion({
+    conversationId,
+    businessId: data.businessId,
+    customerId: data.customerId,
+  });
+
+  return { suggestion };
+});
+
+export const markNotOpportunity = onCall(async (request) => {
+  const { conversationId } = request.data as { conversationId: string };
+  const { convoRef, data, uid } = await assertConversationAccess(request, conversationId);
+
+  await convoRef.update({
+    recommendedAction: null,
+    whyHere: null,
+    updatedAt: Timestamp.now(),
+  });
+
+  await db.collection("opportunities").doc(data.opportunityId).update({
+    excludedFromRecovery: true,
+    excludedAt: Timestamp.now(),
+    // Feedback signal for the opportunity engine's future training (spec §52).
+    feedback: FieldValue.arrayUnion({ type: "not_opportunity", uid, at: Timestamp.now() }),
+  });
+
+  return { success: true };
+});
+
+export const closeConversation = onCall(async (request) => {
+  const { conversationId, reason } = request.data as {
+    conversationId: string;
+    reason: string;
+  };
+  const { convoRef, uid } = await assertConversationAccess(request, conversationId);
+
+  const now = Timestamp.now();
+  await convoRef.update({
+    isClosed: true,
+    status: "lost",
+    closedReason: reason || "Closed by owner",
+    updatedAt: now,
+  });
+
+  await convoRef.collection("timeline").add({
+    _collectionType: "system_event",
+    conversationId,
+    type: "conversation_closed",
+    label: "Closed",
+    timestamp: now,
+  });
+
+  await logSecurityEvent({ type: "conversation_closed", conversationId, uid });
+  return { success: true };
+});
+
+export const reopenConversation = onCall(async (request) => {
+  const { conversationId } = request.data as { conversationId: string };
+  const { convoRef } = await assertConversationAccess(request, conversationId);
+
+  await convoRef.update({
+    isClosed: false,
+    status: "active",
+    closedReason: FieldValue.delete(),
+    updatedAt: Timestamp.now(),
+  });
+
+  return { success: true };
+});
+
+export const deleteConversationRequest = onCall(async (request) => {
+  const { conversationId } = request.data as { conversationId: string };
+  const { convoRef, uid } = await assertConversationAccess(request, conversationId);
+
+  await logSecurityEvent({ type: "conversation_deleted", conversationId, uid });
+
+  // Soft-delete: preserve for audit/compliance, hide from normal listing.
+  await convoRef.update({
+    deleted: true,
+    deletedAt: Timestamp.now(),
+    deletedBy: uid,
+  });
+
+  return { success: true };
+});
+
+export const addPrivateNote = onCall(async (request) => {
+  const { conversationId, body } = request.data as { conversationId: string; body: string };
+  if (!body?.trim()) throw new HttpsError("invalid-argument", "Note body is required.");
+
+  const { convoRef, uid } = await assertConversationAccess(request, conversationId);
+
+  await convoRef.collection("notes").add({
+    conversationId,
+    authorId: uid,
+    body: body.trim(),
+    createdAt: Timestamp.now(),
+  });
+
+  return { success: true };
+});
+
+export const resolveIdentityMatch = onCall(async (request) => {
+  const { conversationId, decision } = request.data as {
+    conversationId: string;
+    decision: "merge" | "keep_separate";
+  };
+  const { data } = await assertConversationAccess(request, conversationId);
+
+  const customerRef = db.collection("customers").doc(data.customerId);
+  const customerSnap = await customerRef.get();
+  if (!customerSnap.exists) throw new HttpsError("not-found", "Customer not found.");
+  const customer = customerSnap.data()!;
+
+  if (decision === "keep_separate") {
+    await customerRef.update({
+      identityConfidence: "confirmed",
+      possibleDuplicateCustomerId: FieldValue.delete(),
+    });
+    return { success: true };
+  }
+
+  const duplicateId = customer.possibleDuplicateCustomerId;
+  if (!duplicateId) {
+    throw new HttpsError("failed-precondition", "No candidate match to merge with.");
+  }
+
+  // Merge: move duplicate's conversations to the primary customer record,
+  // then mark the duplicate inactive. Never silently overwrite history.
+  const batch = db.batch();
+  const dupeConvos = await db
+    .collection("conversations")
+    .where("customerId", "==", duplicateId)
+    .get();
+  dupeConvos.forEach((doc) => {
+    batch.update(doc.ref, { customerId: data.customerId });
+  });
+  batch.update(customerRef, {
+    identityConfidence: "confirmed",
+    possibleDuplicateCustomerId: FieldValue.delete(),
+  });
+  batch.update(db.collection("customers").doc(duplicateId), {
+    mergedInto: data.customerId,
+    active: false,
+  });
+  await batch.commit();
+
+  return { success: true };
+});
+
+export const getAvailableSlots = onCall(async (request) => {
+  const { conversationId, dateIso } = request.data as {
+    conversationId: string;
+    dateIso: string;
+  };
+  const { data } = await assertConversationAccess(request, conversationId);
+
+  const slots = await findAvailableSlots(data.businessId, new Date(dateIso));
+  return { slots };
+});
+
+export const createBooking = onCall(async (request) => {
+  const { conversationId, startTimeIso, endTimeIso, timezone } = request.data as {
+    conversationId: string;
+    startTimeIso: string;
+    endTimeIso: string;
+    timezone: string;
+  };
+  const { convoRef, data, uid } = await assertConversationAccess(request, conversationId);
+
+  const event = await insertCalendarEvent({
+    businessId: data.businessId,
+    customerId: data.customerId,
+    startTimeIso,
+    endTimeIso,
+    timezone,
+  });
+
+  const now = Timestamp.now();
+  const booking = {
+    id: event.eventId,
+    startTime: Timestamp.fromDate(new Date(startTimeIso)),
+    endTime: Timestamp.fromDate(new Date(endTimeIso)),
+    timezone,
+    status: "confirmed",
+    calendarEventId: event.eventId,
+  };
+
+  await convoRef.update({
+    currentBooking: booking,
+    status: "booked",
+    updatedAt: now,
+  });
+
+  await convoRef.collection("timeline").add({
+    _collectionType: "system_event",
+    conversationId,
+    type: "booking_created",
+    label: `Appointment confirmed — ${new Date(startTimeIso).toLocaleString(undefined, {
+      weekday: "short",
+      hour: "numeric",
+      minute: "2-digit",
+    })}`,
+    timestamp: now,
+    metadata: { bookingId: event.eventId },
+  });
+
+  await logSecurityEvent({ type: "booking_created", conversationId, uid });
+
+  return { success: true, bookingId: event.eventId };
+});
+```
+
+---
+
+## 29. `functions/src/conversation/channelDispatch.ts`
+
+```typescript
+// functions/src/conversation/channelDispatch.ts
+
+import { getFirestore } from "firebase-admin/firestore";
+import { Channel } from "./types";
+
+const db = getFirestore();
+
+interface SendParams {
+  businessId: string;
+  customerId: string;
+  channel: Channel;
+  body: string;
+}
+
+/**
+ * Provider abstraction (spec §107–108): the rest of the system never
+ * references Twilio/Meta/etc. directly — only this module does.
+ */
+export async function sendOutboundMessage(params: SendParams): Promise<string> {
+  const customerSnap = await db.collection("customers").doc(params.customerId).get();
+  if (!customerSnap.exists) throw new Error("Customer not found");
+  const customer = customerSnap.data()!;
+
+  switch (params.channel) {
+    case "whatsapp":
+      return sendViaWhatsApp(customer.phone, params.body);
+    case "sms":
+      return sendViaSms(customer.phone, params.body);
+    case "website":
+      return sendViaWebsiteWidget(params.customerId, params.body);
+    case "phone":
+      // Voice channel has no text-send path; caller should use the call flow.
+      throw new Error("Cannot send a text message on the phone channel.");
+    default:
+      throw new Error(`Unsupported channel: ${params.channel}`);
+  }
+}
+
+async function sendViaWhatsApp(phone: string, body: string): Promise<string> {
+  // TODO: integrate WhatsApp Business Cloud API (Meta) send-message endpoint.
+  // Return the provider message ID for delivery-status reconciliation.
+  const providerMessageId = `wa_${Date.now()}`;
+  return providerMessageId;
+}
+
+async function sendViaSms(phone: string, body: string): Promise<string> {
+  // TODO: integrate Twilio (or equivalent) SMS send.
+  const providerMessageId = `sms_${Date.now()}`;
+  return providerMessageId;
+}
+
+async function sendViaWebsiteWidget(customerId: string, body: string): Promise<string> {
+  // TODO: push to the website chat widget's realtime channel.
+  const providerMessageId = `web_${Date.now()}`;
+  return providerMessageId;
+}
+```
+
+---
+
+## 30. `functions/src/conversation/ai.ts`
+
+```typescript
+// functions/src/conversation/ai.ts
+
+import { getFirestore, Timestamp } from "firebase-admin/firestore";
+import Anthropic from "@anthropic-ai/sdk";
+import { defineSecret } from "firebase-functions/params";
+
+const db = getFirestore();
+const anthropicApiKey = defineSecret("ANTHROPIC_API_KEY");
+
+interface SuggestionParams {
+  conversationId: string;
+  businessId: string;
+  customerId: string;
+}
+
+/**
+ * Reply suggestion (spec §25): contextual, single suggestion, never
+ * auto-sent. Also enforces the "no hallucinated facts" gate from spec §47
+ * by only allowing the model to draw on stored business facts + the
+ * observed conversation.
+ */
+export async function generateReplySuggestion(
+  params: SuggestionParams
+): Promise<string | null> {
+  const [recentMessages, businessFacts] = await Promise.all([
+    getRecentMessages(params.conversationId, 20),
+    getBusinessFacts(params.businessId),
+  ]);
+
+  if (recentMessages.length === 0) return null;
+
+  const client = new Anthropic({ apiKey: anthropicApiKey.value() });
+
+  const transcript = recentMessages
+    .map((m) => `${m.senderType}: ${m.body}`)
+    .join("\n");
+
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 200,
+    system: [
+      "You draft one short, concrete reply for a small-business owner to review before sending to a customer.",
+      "Only use facts explicitly present in the business facts or the conversation transcript below.",
+      "Never invent prices, availability, timelines, or promises the business hasn't stated.",
+      "If you cannot draft a safe reply without inventing facts, respond with exactly: NONE",
+      `Business facts: ${JSON.stringify(businessFacts)}`,
+    ].join("\n"),
+    messages: [
+      {
+        role: "user",
+        content: `Conversation so far:\n${transcript}\n\nDraft one short reply from the business.`,
+      },
+    ],
+  });
+
+  const text = response.content
+    .filter((b) => b.type === "text")
+    .map((b) => (b as { text: string }).text)
+    .join("")
+    .trim();
+
+  if (!text || text === "NONE") return null;
+  return text;
+}
+
+async function getRecentMessages(conversationId: string, n: number) {
+  const snap = await db
+    .collection("conversations")
+    .doc(conversationId)
+    .collection("timeline")
+    .where("_collectionType", "==", "message")
+    .orderBy("timestamp", "desc")
+    .limit(n)
+    .get();
+  return snap.docs.map((d) => d.data()).reverse() as { senderType: string; body: string }[];
+}
+
+async function getBusinessFacts(businessId: string) {
+  const snap = await db.collection("businesses").doc(businessId).get();
+  if (!snap.exists) return {};
+  const data = snap.data()!;
+  return {
+    services: data.services ?? [],
+    pricing: data.pricing ?? {},
+    hours: data.hours ?? {},
+    policies: data.policies ?? {},
+  };
+}
+
+/**
+ * Rolling conversation summary (spec §74–75). Runs after each new customer
+ * message to keep the owner-facing summary current, restricted to
+ * business-relevant facts only — never psychological profiling.
+ */
+export async function regenerateConversationSummary(conversationId: string, businessId: string) {
+  const recentMessages = await getRecentMessages(conversationId, 30);
+  if (recentMessages.length === 0) return;
+
+  const client = new Anthropic({ apiKey: anthropicApiKey.value() });
+  const transcript = recentMessages.map((m) => `${m.senderType}: ${m.body}`).join("\n");
+
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 120,
+    system: [
+      "Summarize this customer conversation in one or two short sentences for a business owner.",
+      "Include only: the request, timing/location preferences, quotes/pricing discussed, appointment status, and the next expected action.",
+      "Never include personality assessments, sensitive personal characteristics, or speculation.",
+    ].join("\n"),
+    messages: [{ role: "user", content: transcript }],
+  });
+
+  const summary = response.content
+    .filter((b) => b.type === "text")
+    .map((b) => (b as { text: string }).text)
+    .join("")
+    .trim();
+
+  if (summary) {
+    await db.collection("conversations").doc(conversationId).update({
+      summary,
+      updatedAt: Timestamp.now(),
+    });
+  }
+}
+```
+
+---
+
+## 31. `functions/src/conversation/calendar.ts`
+
+```typescript
+// functions/src/conversation/calendar.ts
+
+import { google } from "googleapis";
+import { getFirestore } from "firebase-admin/firestore";
+import { defineSecret } from "firebase-functions/params";
+
+const db = getFirestore();
+const googleClientSecret = defineSecret("GOOGLE_OAUTH_CLIENT_SECRET");
+
+async function getAuthorizedClient(businessId: string) {
+  const businessSnap = await db.collection("businesses").doc(businessId).get();
+  if (!businessSnap.exists) throw new Error("Business not found");
+  const business = businessSnap.data()!;
+  const tokens = business.googleCalendarTokens;
+  if (!tokens?.refresh_token) {
+    throw new Error("Calendar isn't connected for this business.");
+  }
+
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_OAUTH_CLIENT_ID,
+    googleClientSecret.value()
+  );
+  oauth2Client.setCredentials({ refresh_token: tokens.refresh_token });
+  return oauth2Client;
+}
+
+/**
+ * Uses Google Calendar's events.insert endpoint for booking creation,
+ * as referenced in the spec (§30). Availability is computed from
+ * freebusy.query against the business's connected calendar plus a
+ * configured working-hours window.
+ */
+export async function findAvailableSlots(
+  businessId: string,
+  date: Date
+): Promise<{ startIso: string; endIso: string }[]> {
+  const businessSnap = await db.collection("businesses").doc(businessId).get();
+  const business = businessSnap.data() ?? {};
+  const workingHours = business.workingHours ?? { startHour: 9, endHour: 17 };
+  const slotMinutes = business.appointmentSlotMinutes ?? 60;
+  const calendarId = business.googleCalendarId ?? "primary";
+
+  const auth = await getAuthorizedClient(businessId);
+  const calendar = google.calendar({ version: "v3", auth });
+
+  const dayStart = new Date(date);
+  dayStart.setHours(workingHours.startHour, 0, 0, 0);
+  const dayEnd = new Date(date);
+  dayEnd.setHours(workingHours.endHour, 0, 0, 0);
+
+  const freebusy = await calendar.freebusy.query({
+    requestBody: {
+      timeMin: dayStart.toISOString(),
+      timeMax: dayEnd.toISOString(),
+      items: [{ id: calendarId }],
+    },
+  });
+
+  const busy = freebusy.data.calendars?.[calendarId]?.busy ?? [];
+
+  const slots: { startIso: string; endIso: string }[] = [];
+  const cursor = new Date(dayStart);
+  while (cursor < dayEnd) {
+    const slotEnd = new Date(cursor.getTime() + slotMinutes * 60000);
+    if (slotEnd > dayEnd) break;
+
+    const overlapsBusy = busy.some((b) => {
+      const bStart = new Date(b.start!);
+      const bEnd = new Date(b.end!);
+      return cursor < bEnd && slotEnd > bStart;
+    });
+
+    const isPast = cursor.getTime() < Date.now();
+
+    if (!overlapsBusy && !isPast) {
+      slots.push({ startIso: cursor.toISOString(), endIso: slotEnd.toISOString() });
+    }
+    cursor.setTime(cursor.getTime() + slotMinutes * 60000);
+  }
+
+  return slots;
+}
+
+export async function insertCalendarEvent(params: {
+  businessId: string;
+  customerId: string;
+  startTimeIso: string;
+  endTimeIso: string;
+  timezone: string;
+}): Promise<{ eventId: string }> {
+  const businessSnap = await db.collection("businesses").doc(params.businessId).get();
+  const business = businessSnap.data() ?? {};
+  const calendarId = business.googleCalendarId ?? "primary";
+
+  const customerSnap = await db.collection("customers").doc(params.customerId).get();
+  const customer = customerSnap.data() ?? {};
+
+  const auth = await getAuthorizedClient(params.businessId);
+  const calendar = google.calendar({ version: "v3", auth });
+
+  const event = await calendar.events.insert({
+    calendarId,
+    requestBody: {
+      summary: `Appointment — ${customer.name ?? "Customer"}`,
+      start: { dateTime: params.startTimeIso, timeZone: params.timezone },
+      end: { dateTime: params.endTimeIso, timeZone: params.timezone },
+      description: `Booked via Isolynic for customer ${customer.name ?? params.customerId}.`,
+    },
+  });
+
+  if (!event.data.id) throw new Error("Calendar did not return an event id.");
+  return { eventId: event.data.id };
+}
+```
+
+---
+
+## 32. `functions/src/conversation/audit.ts`
+
+```typescript
+// functions/src/conversation/audit.ts
+
+import { getFirestore, Timestamp } from "firebase-admin/firestore";
+
+const db = getFirestore();
+
+interface AuditEntry {
+  type: string;
+  conversationId: string;
+  uid: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Server-side security event log (spec §122) — records significant
+ * actions without exposing internal audit mechanics to the owner UI.
+ */
+export async function logSecurityEvent(entry: AuditEntry) {
+  await db.collection("securityEvents").add({
+    ...entry,
+    at: Timestamp.now(),
+  });
+}
+```
+
+---
+
+## 33. `functions/src/conversation/triggers.ts`
+
+```typescript
+// functions/src/conversation/triggers.ts
+
+import { onDocumentCreated } from "firebase-functions/v2/firestore";
+import { getFirestore, Timestamp } from "firebase-admin/firestore";
+import { regenerateConversationSummary } from "./ai";
+import { evaluateOpportunityStatus } from "./opportunityEngine";
+import { sendOwnerNotification } from "./notifications";
+
+const db = getFirestore();
+
+/**
+ * Fires on every new timeline item (message or system event). Owns:
+ *  - rolling summary regeneration (customer messages only, to bound cost)
+ *  - opportunity status re-evaluation ("needs attention" / "waiting" / etc.)
+ *  - meaningful-state-only notifications (spec §54)
+ */
+export const onTimelineItemCreated = onDocumentCreated(
+  "conversations/{conversationId}/timeline/{itemId}",
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    const item = snap.data();
+    const conversationId = event.params.conversationId as string;
+
+    const convoRef = db.collection("conversations").doc(conversationId);
+    const convoSnap = await convoRef.get();
+    if (!convoSnap.exists) return;
+    const conversation = convoSnap.data()!;
+
+    // Update last-activity timestamps.
+    if (item._collectionType === "message") {
+      const now = Timestamp.now();
+      const activityField =
+        item.senderType === "CUSTOMER"
+          ? "lastCustomerActivity"
+          : item.senderType === "OWNER"
+          ? "lastOwnerActivity"
+          : item.senderType === "ISOLYNIC"
+          ? "lastIsolynicActivity"
+          : null;
+
+      const updates: Record<string, unknown> = { updatedAt: now };
+      if (activityField) updates[activityField] = now;
+
+      if (item.senderType === "CUSTOMER") {
+        updates.ownershipMode = conversation.ownershipMode === "OWNER" ? "OWNER" : "WAITING";
+      }
+
+      await convoRef.update(updates);
+    }
+
+    if (item._collectionType === "message" && item.senderType === "CUSTOMER") {
+      await regenerateConversationSummary(conversationId, conversation.businessId);
+    }
+
+    const evaluation = await evaluateOpportunityStatus(conversationId);
+    if (evaluation.statusChanged) {
+      await convoRef.update({
+        status: evaluation.status,
+        whyHere: evaluation.whyHere,
+        recommendedAction: evaluation.recommendedAction,
+        updatedAt: Timestamp.now(),
+      });
+
+      await convoRef.collection("timeline").add({
+        _collectionType: "system_event",
+        conversationId,
+        type: "status_changed",
+        label: evaluation.timelineLabel,
+        timestamp: Timestamp.now(),
+      });
+
+      if (evaluation.shouldNotifyOwner) {
+        await sendOwnerNotification({
+          businessId: conversation.businessId,
+          conversationId,
+          title: evaluation.notificationTitle,
+          body: evaluation.notificationBody,
+        });
+      }
+    }
+  }
+);
+```
+
+---
+
+## 34. `functions/src/conversation/opportunityEngine.ts`
+
+```typescript
+// functions/src/conversation/opportunityEngine.ts
+
+import { getFirestore, Timestamp } from "firebase-admin/firestore";
+import { OpportunityStatus } from "./types";
+
+const db = getFirestore();
+
+const STALE_AFTER_MS = 1000 * 60 * 60 * 24 * 3; // 3 days, per spec's quote-follow-up example
+
+interface EvaluationResult {
+  statusChanged: boolean;
+  status: OpportunityStatus;
+  whyHere: string | null;
+  recommendedAction: { action: string; reason: string } | null;
+  timelineLabel: string;
+  shouldNotifyOwner: boolean;
+  notificationTitle: string;
+  notificationBody: string;
+}
+
+/**
+ * Deterministic, explainable status logic (spec §13, §83): every
+ * transition is derived from observable conversation facts, never a
+ * hidden confidence score. Extend this with product-specific policy
+ * rules (discount requests, disputes, etc.) as the business rules module
+ * grows — kept intentionally explicit rather than opaque ML scoring so
+ * the owner-facing "why" text always matches the underlying trigger.
+ */
+export async function evaluateOpportunityStatus(
+  conversationId: string
+): Promise<EvaluationResult> {
+  const convoRef = db.collection("conversations").doc(conversationId);
+  const convoSnap = await convoRef.get();
+  const conversation = convoSnap.data()!;
+
+  if (conversation.isClosed) {
+    return unchanged(conversation.status);
+  }
+
+  const lastMessageSnap = await convoRef
+    .collection("timeline")
+    .where("_collectionType", "==", "message")
+    .orderBy("timestamp", "desc")
+    .limit(1)
+    .get();
+
+  if (lastMessageSnap.empty) return unchanged(conversation.status);
+  const lastMessage = lastMessageSnap.docs[0].data();
+
+  const now = Date.now();
+  const lastMessageAge = now - lastMessage.timestamp.toMillis();
+
+  // Customer sent a message requiring a business-policy answer Isolynic
+  // can't safely provide (e.g. unapproved discount request) → escalate.
+  if (
+    lastMessage.senderType === "CUSTOMER" &&
+    requiresOwnerJudgment(lastMessage.body) &&
+    conversation.ownershipMode !== "OWNER"
+  ) {
+    return {
+      statusChanged: conversation.status !== "needs_attention",
+      status: "needs_attention",
+      whyHere: "The customer is asking for something Isolynic can't safely answer on its own.",
+      recommendedAction: {
+        action: "take_over",
+        reason: "This needs your judgment.",
+      },
+      timelineLabel: "Needs your attention",
+      shouldNotifyOwner: true,
+      notificationTitle: "Needs your attention",
+      notificationBody: "A customer is asking something Isolynic can't safely answer.",
+    };
+  }
+
+  // Customer went quiet after a business-side (owner/Isolynic) message.
+  if (
+    (lastMessage.senderType === "OWNER" || lastMessage.senderType === "ISOLYNIC") &&
+    lastMessageAge > STALE_AFTER_MS &&
+    conversation.status !== "needs_attention"
+  ) {
+    return {
+      statusChanged: true,
+      status: "needs_attention",
+      whyHere: "The customer hasn't responded in a few days.",
+      recommendedAction: {
+        action: "recover",
+        reason: "A quick follow-up could bring them back.",
+      },
+      timelineLabel: "Needs your attention",
+      shouldNotifyOwner: true,
+      notificationTitle: "A customer may be slipping away",
+      notificationBody: "They haven't responded in a few days.",
+    };
+  }
+
+  // Customer just replied — if we were previously in needs_attention, this
+  // is a recovery.
+  if (lastMessage.senderType === "CUSTOMER" && conversation.status === "needs_attention") {
+    return {
+      statusChanged: true,
+      status: "recovered",
+      whyHere: null,
+      recommendedAction: null,
+      timelineLabel: "Customer responded after follow-up",
+      shouldNotifyOwner: false,
+      notificationTitle: "",
+      notificationBody: "",
+    };
+  }
+
+  if (lastMessage.senderType === "CUSTOMER") {
+    return {
+      statusChanged: conversation.status !== "waiting_for_customer" && conversation.ownershipMode !== "OWNER" ? false : false,
+      status: conversation.ownershipMode === "OWNER" ? "active" : "isolynic_handling",
+      whyHere: null,
+      recommendedAction: null,
+      timelineLabel: "",
+      shouldNotifyOwner: false,
+      notificationTitle: "",
+      notificationBody: "",
+    };
+  }
+
+  return {
+    statusChanged: conversation.status !== "waiting_for_customer",
+    status: "waiting_for_customer",
+    whyHere: null,
+    recommendedAction: null,
+    timelineLabel: "",
+    shouldNotifyOwner: false,
+    notificationTitle: "",
+    notificationBody: "",
+  };
+}
+
+function requiresOwnerJudgment(body: 
