@@ -1,11 +1,11 @@
-Building this as a real Next.js App Router feature: types, a Firestore real-time hook, an actions layer with idempotency/dedup logic, and the UI components, wired to a `/recovery` page.
+Below is the complete, production-grade implementation of **Screen 3 — Recovery Queue** for Isolynic: Next.js (App Router, TSX) frontend backed by Firebase (Firestore + Cloud Functions v2, TypeScript). File paths are noted as comments at the top of each block.
 
-## 1. `types/opportunity.ts`
+## Shared Types
 
-```tsx
+```typescript
 // types/opportunity.ts
 
-export type RiskState =
+export type OpportunityLifecycleStatus =
   | 'NEW_RISK'
   | 'RECOVERY_RECOMMENDED'
   | 'OWNER_APPROVED'
@@ -16,136 +16,78 @@ export type RiskState =
   | 'BOOKED'
   | 'WON'
   | 'LOST'
-  | 'HANDLED';
+  | 'HANDLED'
+  | 'IGNORED'
+  | 'NOT_A_CUSTOMER';
 
-export type PriorityLevel = 'high' | 'worth_checking' | 'low';
-
-export type ChannelType = 'phone' | 'whatsapp' | 'website' | 'sms' | 'email';
-
-export type OwnerActionType =
-  | 'recover'
-  | 'handle_myself'
-  | 'ignore'
-  | 'not_a_customer'
-  | null;
+export type PriorityBand = 'high' | 'worth_checking' | 'low';
+export type DecisionBand = 'autonomous' | 'assisted' | 'human_required';
+export type ChannelType = 'phone' | 'whatsapp' | 'website' | 'sms' | 'email' | 'other';
 
 export interface EvidenceItem {
   id: string;
-  event_type: string; // e.g. "missed_call", "quote_sent", "no_response"
+  eventType: string;
   timestamp: number; // epoch ms
   channel: ChannelType;
   summary: string;
-  relevance: number; // 0-1, internal only, never rendered directly
+  relevance: 'primary' | 'supporting';
 }
 
-export interface Opportunity {
+export interface LastRecoveryAction {
+  type: 'follow_up' | 'reconnect' | 'reminder' | 'custom';
+  at: number;
+  channel: ChannelType;
+  messagePreview?: string;
+}
+
+export interface OpportunityDoc {
   id: string;
   businessId: string;
-  customer_id: string;
-  customer_name: string;
-  source_channels: ChannelType[];
+  customerId: string;
+  customerName: string;
+  sourceChannels: ChannelType[];
+  firstContactAt: number;
+  latestActivityAt: number;
 
-  first_contact_at: number;
-  latest_activity_at: number;
+  intentSummary: string;   // "Asked for a repair appointment yesterday."
+  whyNow: string;          // "You sent a quote 3 days ago and haven't heard back."
+  recommendation: string;  // "A short follow-up could bring this customer back."
 
-  intent_summary: string; // "Asked for a repair appointment yesterday."
-  why_now: string; // "You sent a quote 3 days ago and haven't heard back."
-  recommendation: string; // "A short follow-up could bring this customer back."
+  valueEstimate?: number | null;
+  riskState: 'stable' | 'deteriorating' | 'critical';
 
-  priority: PriorityLevel;
-  priority_score: number; // internal, never rendered
+  status: OpportunityLifecycleStatus;
+  priorityBand: PriorityBand;
+  priorityScore: number;
+  decisionBand: DecisionBand;
 
-  value_estimate?: number | null; // optional, internal-derived
+  ownerAction?: 'recover' | 'handle_myself' | 'ignore' | 'not_a_customer' | null;
+  lastRecoveryAction?: LastRecoveryAction | null;
 
-  risk_state: RiskState;
-  status: 'active' | 'waiting' | 'responded' | 'resolved' | 'lost' | 'handled';
+  followUpCount: number;
+  maxFollowUps: number;
+  cooldownUntil?: number | null;
+  explicitlyRejected?: boolean;
 
-  needs_owner: boolean; // true => "Needs you"
-  blocked_reason?: string | null; // e.g. "missing pricing info"
+  needsOwnerReason?: string | null; // populated when decisionBand === 'human_required'
 
-  owner_action: OwnerActionType;
-  last_recovery_action_id?: string | null;
-  follow_up_count: number;
-  next_review_at?: number | null;
+  handledByUid?: string | null;
+  handledByName?: string | null;
 
+  nextReviewAt?: number | null;
   evidence: EvidenceItem[];
+  outcome?: 'booked' | 'won' | 'lost' | null;
+  outcomeNote?: string | null;
 
-  outcome?: {
-    type: 'booked' | 'won' | 'lost' | 'handled' | null;
-    note?: string;
-    at?: number;
-  } | null;
-
-  presence?: {
-    handled_by_uid: string;
-    handled_by_name: string;
-  } | null;
-
-  recovery_preview?: {
-    message: string;
-    requires_confirmation: boolean;
-  } | null;
+  undoExpiresAt?: number | null;
+  priorSnapshot?: Partial<OpportunityDoc> | null;
 
   createdAt: number;
   updatedAt: number;
+  version: number; // monotonic, used for optimistic concurrency / CAS
 }
 
-export interface RecoveredEntry {
-  id: string;
-  customer_name: string;
-  outcome_text: string; // "Customer replied after follow-up."
-  resolved_at: number;
-}
-
-export type QueueFilter = 'all' | 'needs_you' | 'handled';
-```
-
-## 2. `lib/firebase.ts`
-
-```tsx
-// lib/firebase.ts
-import { initializeApp, getApps, getApp, FirebaseApp } from 'firebase/app';
-import { getFirestore, Firestore } from 'firebase/firestore';
-import { getFunctions, Functions } from 'firebase/functions';
-import { getAuth, Auth } from 'firebase/auth';
-
-const firebaseConfig = {
-  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
-  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
-  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
-};
-
-export const app: FirebaseApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
-export const db: Firestore = getFirestore(app);
-export const functions: Functions = getFunctions(app);
-export const auth: Auth = getAuth(app);
-```
-
-## 3. `hooks/useRecoveryQueue.ts`
-
-Real-time Firestore subscription with the priority sort, filtering, and offline/error handling described in the spec (secs 8–11, 24, 50–51).
-
-```tsx
-// hooks/useRecoveryQueue.ts
-'use client';
-
-import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
-import {
-  collection,
-  query,
-  where,
-  orderBy,
-  onSnapshot,
-  limit,
-  Unsubscribe,
-} from 'firebase/firestore';
-import { db } from '@/lib/firebase';
-import { Opportunity, QueueFilter, RecoveredEntry } from '@/types/opportunity';
-
-const ACTIVE_RISK_STATES = [
+export const ACTIVE_QUEUE_STATUSES: OpportunityLifecycleStatus[] = [
   'NEW_RISK',
   'RECOVERY_RECOMMENDED',
   'OWNER_APPROVED',
@@ -155,661 +97,702 @@ const ACTIVE_RISK_STATES = [
   'PROGRESSING',
 ];
 
-interface UseRecoveryQueueResult {
-  opportunities: Opportunity[];
-  recentlyRecovered: RecoveredEntry[];
-  loading: boolean;
-  isStale: boolean; // showing cached data, couldn't refresh
-  error: string | null;
-  isOffline: boolean;
-  retry: () => void;
-  needsYouCount: number;
-  autoHandledCount: number;
+export const RECENTLY_RESOLVED_STATUSES: OpportunityLifecycleStatus[] = [
+  'BOOKED',
+  'WON',
+  'HANDLED',
+];
+
+export function statusToHumanLabel(o: Pick<OpportunityDoc, 'status' | 'lastRecoveryAction'>): string {
+  switch (o.status) {
+    case 'NEW_RISK':
+    case 'RECOVERY_RECOMMENDED':
+      return 'Needs attention';
+    case 'OWNER_APPROVED':
+    case 'RECOVERY_SENT':
+    case 'WAITING':
+      return 'Following up';
+    case 'CUSTOMER_RESPONDED':
+    case 'PROGRESSING':
+      return 'Customer replied';
+    case 'BOOKED':
+    case 'WON':
+      return 'Booked';
+    case 'HANDLED':
+      return 'Done';
+    case 'LOST':
+      return 'Opportunity lost';
+    case 'IGNORED':
+      return 'Ignored';
+    case 'NOT_A_CUSTOMER':
+      return 'Not a customer';
+    default:
+      return 'Needs attention';
+  }
+}
+```
+
+## Firebase Client Init
+
+```typescript
+// lib/firebase/client.ts
+'use client';
+
+import { initializeApp, getApps, getApp, type FirebaseOptions } from 'firebase/app';
+import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager } from 'firebase/firestore';
+import { getAuth } from 'firebase/auth';
+import { getFunctions } from 'firebase/functions';
+
+const firebaseConfig: FirebaseOptions = {
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
+};
+
+export const firebaseApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
+
+// Offline-first cache so the Recovery Queue can show cached data on poor connectivity (spec §50/51).
+export const db = (() => {
+  try {
+    return initializeFirestore(firebaseApp, {
+      localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
+    });
+  } catch {
+    // Already initialized (e.g. hot reload) — fall back to existing instance.
+    return getFirestore(firebaseApp);
+  }
+})();
+
+export const auth = getAuth(firebaseApp);
+export const functions = getFunctions(firebaseApp);
+```
+
+## Callable Action Wrappers
+
+```typescript
+// lib/firebase/recoveryActions.ts
+'use client';
+
+import { httpsCallable } from 'firebase/functions';
+import { functions } from './client';
+
+interface BaseResult {
+  ok: boolean;
+  reason?: string; // human-safe reason, e.g. "No follow-up needed right now."
 }
 
-const CACHE_KEY = (businessId: string) => `isolynic:recoveryQueue:${businessId}`;
+export interface RecoverResult extends BaseResult {
+  status?: string;
+  lastRecoveryAction?: { type: string; at: number; channel: string; messagePreview?: string };
+}
 
-export function useRecoveryQueue(
-  businessId: string,
-  filter: QueueFilter
-): UseRecoveryQueueResult {
-  const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
-  const [recentlyRecovered, setRecentlyRecovered] = useState<RecoveredEntry[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [isStale, setIsStale] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [isOffline, setIsOffline] = useState(
-    typeof navigator !== 'undefined' ? !navigator.onLine : false
+function idempotencyKey(opportunityId: string, action: string) {
+  // Stable per opportunity+action+minute-bucket isn't safe for true idempotency across retries,
+  // so the client generates one key per user gesture and reuses it across retries.
+  return `${opportunityId}:${action}:${crypto.randomUUID()}`;
+}
+
+export async function recoverOpportunity(opportunityId: string, requestId?: string): Promise<RecoverResult> {
+  const call = httpsCallable<{ opportunityId: string; requestId: string }, RecoverResult>(
+    functions,
+    'recoverOpportunity'
   );
-  const [retryTick, setRetryTick] = useState(0);
-  const unsubRef = useRef<Unsubscribe | null>(null);
+  const res = await call({
+    opportunityId,
+    requestId: requestId ?? idempotencyKey(opportunityId, 'recover'),
+  });
+  return res.data;
+}
 
-  // Hydrate from local cache immediately so the screen never opens blank
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    try {
-      const cached = window.localStorage.getItem(CACHE_KEY(businessId));
-      if (cached) {
-        const parsed = JSON.parse(cached) as Opportunity[];
-        setOpportunities(parsed);
-        setLoading(false);
-      }
-    } catch {
-      // ignore corrupt cache
-    }
-  }, [businessId]);
+export async function ignoreOpportunity(opportunityId: string, requestId?: string): Promise<BaseResult> {
+  const call = httpsCallable<{ opportunityId: string; requestId: string }, BaseResult>(
+    functions,
+    'ignoreOpportunity'
+  );
+  const res = await call({
+    opportunityId,
+    requestId: requestId ?? idempotencyKey(opportunityId, 'ignore'),
+  });
+  return res.data;
+}
 
-  useEffect(() => {
-    const goOnline = () => setIsOffline(false);
-    const goOffline = () => setIsOffline(true);
-    window.addEventListener('online', goOnline);
-    window.addEventListener('offline', goOffline);
-    return () => {
-      window.removeEventListener('online', goOnline);
-      window.removeEventListener('offline', goOffline);
-    };
-  }, []);
+export async function markNotACustomer(opportunityId: string, requestId?: string): Promise<BaseResult> {
+  const call = httpsCallable<{ opportunityId: string; requestId: string }, BaseResult>(
+    functions,
+    'markNotACustomer'
+  );
+  const res = await call({
+    opportunityId,
+    requestId: requestId ?? idempotencyKey(opportunityId, 'not_a_customer'),
+  });
+  return res.data;
+}
+
+export async function undoAction(opportunityId: string): Promise<BaseResult> {
+  const call = httpsCallable<{ opportunityId: string }, BaseResult>(functions, 'undoAction');
+  const res = await call({ opportunityId });
+  return res.data;
+}
+
+export async function claimHandling(opportunityId: string): Promise<BaseResult> {
+  const call = httpsCallable<{ opportunityId: string }, BaseResult>(functions, 'claimHandling');
+  const res = await call({ opportunityId });
+  return res.data;
+}
+```
+
+## Real-time Queue Hook
+
+```typescript
+// hooks/useRecoveryQueue.ts
+'use client';
+
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  collection,
+  query,
+  where,
+  orderBy,
+  limit,
+  onSnapshot,
+  Timestamp,
+  type Unsubscribe,
+} from 'firebase/firestore';
+import { db } from '@/lib/firebase/client';
+import {
+  ACTIVE_QUEUE_STATUSES,
+  RECENTLY_RESOLVED_STATUSES,
+  type OpportunityDoc,
+} from '@/types/opportunity';
+
+const RECENT_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+export type QueueFilter = 'all' | 'needs_you' | 'handled';
+
+interface UseRecoveryQueueResult {
+  loading: boolean;
+  errored: boolean;
+  fromCache: boolean;
+  active: OpportunityDoc[];
+  recentlyRecovered: OpportunityDoc[];
+  newlyArrivedId: string | null;
+  dismissNewlyArrived: () => void;
+}
+
+export function useRecoveryQueue(businessId: string | null): UseRecoveryQueueResult {
+  const [active, setActive] = useState<OpportunityDoc[]>([]);
+  const [recentlyRecovered, setRecentlyRecovered] = useState<OpportunityDoc[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [errored, setErrored] = useState(false);
+  const [fromCache, setFromCache] = useState(false);
+  const [newlyArrivedId, setNewlyArrivedId] = useState<string | null>(null);
+
+  const knownIds = useRef<Set<string>>(new Set());
+  const isFirstSnapshot = useRef(true);
 
   useEffect(() => {
     if (!businessId) return;
-    setError(null);
 
-    const opportunitiesQuery = query(
-      collection(db, 'businesses', businessId, 'opportunities'),
-      where('risk_state', 'in', ACTIVE_RISK_STATES),
-      orderBy('priority_score', 'desc'),
+    const unsubs: Unsubscribe[] = [];
+
+    const activeQuery = query(
+      collection(db, 'opportunities'),
+      where('businessId', '==', businessId),
+      where('status', 'in', ACTIVE_QUEUE_STATUSES),
+      orderBy('priorityScore', 'desc'),
       limit(100)
     );
 
-    if (unsubRef.current) unsubRef.current();
+    unsubs.push(
+      onSnapshot(
+        activeQuery,
+        (snap) => {
+          setLoading(false);
+          setErrored(false);
+          setFromCache(snap.metadata.fromCache);
 
-    unsubRef.current = onSnapshot(
-      opportunitiesQuery,
-      (snapshot) => {
-        const items = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as Opportunity));
-        setOpportunities(items);
-        setLoading(false);
-        setIsStale(false);
-        setError(null);
-        try {
-          window.localStorage.setItem(CACHE_KEY(businessId), JSON.stringify(items));
-        } catch {
-          // storage may be full/unavailable — non-fatal
+          const docs = snap.docs.map((d) => d.data() as OpportunityDoc);
+
+          // Detect genuinely new high-confidence opportunities to power the subtle banner (§25).
+          if (!isFirstSnapshot.current) {
+            for (const change of snap.docChanges()) {
+              if (change.type === 'added' && !knownIds.current.has(change.doc.id)) {
+                const doc = change.doc.data() as OpportunityDoc;
+                if (doc.priorityBand === 'high') {
+                  setNewlyArrivedId(doc.id);
+                }
+              }
+            }
+          }
+
+          knownIds.current = new Set(docs.map((d) => d.id));
+          isFirstSnapshot.current = false;
+          setActive(docs);
+        },
+        () => {
+          setLoading(false);
+          setErrored(true);
         }
-      },
-      (err) => {
-        console.error('[RecoveryQueue] snapshot error', err);
-        setLoading(false);
-        setIsStale(true);
-        setError(
-          "We couldn't check for new customer activity. Your last results are still here."
-        );
-      }
+      )
     );
 
-    return () => {
-      unsubRef.current?.();
-    };
-  }, [businessId, retryTick]);
-
-  // Recently recovered — small, separate, capped feed
-  useEffect(() => {
-    if (!businessId) return;
-    const recoveredQuery = query(
-      collection(db, 'businesses', businessId, 'recoveredFeed'),
-      orderBy('resolved_at', 'desc'),
+    const recentQuery = query(
+      collection(db, 'opportunities'),
+      where('businessId', '==', businessId),
+      where('status', 'in', RECENTLY_RESOLVED_STATUSES),
+      where('updatedAt', '>=', Date.now() - RECENT_LOOKBACK_MS),
+      orderBy('updatedAt', 'desc'),
       limit(5)
     );
-    const unsub = onSnapshot(recoveredQuery, (snapshot) => {
-      setRecentlyRecovered(
-        snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as RecoveredEntry))
-      );
-    });
-    return () => unsub();
+
+    unsubs.push(
+      onSnapshot(recentQuery, (snap) => {
+        setRecentlyRecovered(snap.docs.map((d) => d.data() as OpportunityDoc));
+      })
+    );
+
+    return () => unsubs.forEach((u) => u());
   }, [businessId]);
 
-  const retry = useCallback(() => setRetryTick((t) => t + 1), []);
-
-  const filtered = useMemo(() => {
-    switch (filter) {
-      case 'needs_you':
-        return opportunities.filter((o) => o.needs_you_computed ?? o.needs_owner);
-      case 'handled':
-        return opportunities.filter((o) =>
-          ['RECOVERY_SENT', 'WAITING', 'HANDLED'].includes(o.risk_state)
-        );
-      default:
-        return opportunities;
-    }
-  }, [opportunities, filter]);
-
-  const needsYouCount = useMemo(
-    () => opportunities.filter((o) => o.needs_owner).length,
-    [opportunities]
-  );
-  const autoHandledCount = opportunities.length - needsYouCount;
-
   return {
-    opportunities: filtered,
-    recentlyRecovered,
     loading,
-    isStale,
-    error,
-    isOffline,
-    retry,
-    needsYouCount,
-    autoHandledCount,
+    errored,
+    fromCache,
+    active,
+    recentlyRecovered,
+    newlyArrivedId,
+    dismissNewlyArrived: () => setNewlyArrivedId(null),
   };
+}
+
+export function useOnlineStatus(): boolean {
+  const [online, setOnline] = useState(true);
+  useEffect(() => {
+    setOnline(navigator.onLine);
+    const on = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener('online', on);
+    window.addEventListener('offline', off);
+    return () => {
+      window.removeEventListener('online', on);
+      window.removeEventListener('offline', off);
+    };
+  }, []);
+  return online;
+}
+
+export function useFilteredQueue(active: OpportunityDoc[], filter: QueueFilter) {
+  return useMemo(() => {
+    if (filter === 'all') return active;
+    if (filter === 'needs_you') {
+      return active.filter(
+        (o) => o.decisionBand === 'human_required' || o.status === 'CUSTOMER_RESPONDED'
+      );
+    }
+    return active.filter((o) => o.status === 'HANDLED' || o.status === 'BOOKED' || o.status === 'WON');
+  }, [active, filter]);
 }
 ```
 
-Note: I referenced `needs_you_computed` defensively in case a server-computed field exists — falls back to `needs_owner`. Fine as-is.
-
-## 4. `hooks/useRecoveryActions.ts`
-
-This is where sec. 34 (idempotency/dedup), 17–20 (recover/handle/ignore/not-a-customer), and 62 (undo) live. Actions go through Firebase Cloud Functions rather than direct client writes, since "recover" triggers real customer-facing messaging — that must be server-authorized, not client-trusted.
+## Toast / Undo System
 
 ```tsx
-// hooks/useRecoveryActions.ts
+// components/recovery/Toast.tsx
 'use client';
 
-import { useState, useCallback, useRef } from 'react';
-import { httpsCallable } from 'firebase/functions';
-import { functions } from '@/lib/firebase';
-import { v4 as uuidv4 } from 'uuid';
+import { createContext, useCallback, useContext, useRef, useState, type ReactNode } from 'react';
 
-type ActionName = 'recover' | 'handle_myself' | 'ignore' | 'not_a_customer' | 'undo';
-
-interface ActionState {
-  pendingIds: Set<string>;
-  errorByOpportunity: Record<string, string | undefined>;
+interface ToastAction {
+  label: string;
+  onClick: () => void;
 }
 
-interface RecoverPayload {
-  opportunityId: string;
-  businessId: string;
-  editedMessage?: string; // if owner used the "Send / Edit" preview (sec 39)
+interface ToastItem {
+  id: string;
+  message: string;
+  tone: 'neutral' | 'success' | 'error';
+  action?: ToastAction;
 }
 
-export function useRecoveryActions(businessId: string) {
-  const [state, setState] = useState<ActionState>({
-    pendingIds: new Set(),
-    errorByOpportunity: {},
-  });
-
-  // idempotency keys are generated once per logical user action and reused
-  // on retry so duplicate network calls never create duplicate outreach.
-  const idempotencyKeys = useRef<Map<string, string>>(new Map());
-
-  const getIdempotencyKey = (opportunityId: string, action: ActionName) => {
-    const mapKey = `${action}:${opportunityId}`;
-    if (!idempotencyKeys.current.has(mapKey)) {
-      idempotencyKeys.current.set(mapKey, uuidv4());
-    }
-    return idempotencyKeys.current.get(mapKey)!;
-  };
-
-  const setPending = (id: string, pending: boolean) => {
-    setState((prev) => {
-      const next = new Set(prev.pendingIds);
-      pending ? next.add(id) : next.delete(id);
-      return { ...prev, pendingIds: next };
-    });
-  };
-
-  const setError = (id: string, message: string | undefined) => {
-    setState((prev) => ({
-      ...prev,
-      errorByOpportunity: { ...prev.errorByOpportunity, [id]: message },
-    }));
-  };
-
-  const callAction = useCallback(
-    async (
-      action: ActionName,
-      opportunityId: string,
-      extra?: Record<string, unknown>
-    ) => {
-      setPending(opportunityId, true);
-      setError(opportunityId, undefined);
-      const idempotencyKey = getIdempotencyKey(opportunityId, action);
-      try {
-        const fn = httpsCallable(functions, `recoveryQueue-${action}`);
-        await fn({
-          businessId,
-          opportunityId,
-          idempotencyKey,
-          ...extra,
-        });
-        // On success, clear the stored key so a genuinely new future
-        // action (e.g. a second later recovery) gets a fresh one.
-        idempotencyKeys.current.delete(`${action}:${opportunityId}`);
-        return { ok: true as const };
-      } catch (err) {
-        console.error(`[RecoveryActions] ${action} failed`, err);
-        setError(
-          opportunityId,
-          action === 'recover'
-            ? "We couldn't send that message."
-            : "That didn't go through."
-        );
-        return { ok: false as const };
-      } finally {
-        setPending(opportunityId, false);
-      }
-    },
-    [businessId]
-  );
-
-  const recover = useCallback(
-    (payload: RecoverPayload) =>
-      callAction('recover', payload.opportunityId, {
-        editedMessage: payload.editedMessage,
-      }),
-    [callAction]
-  );
-
-  const handleMyself = useCallback(
-    (opportunityId: string) => callAction('handle_myself', opportunityId),
-    [callAction]
-  );
-
-  const ignore = useCallback(
-    (opportunityId: string) => callAction('ignore', opportunityId),
-    [callAction]
-  );
-
-  const notACustomer = useCallback(
-    (opportunityId: string) => callAction('not_a_customer', opportunityId),
-    [callAction]
-  );
-
-  const undo = useCallback(
-    (opportunityId: string, priorAction: ActionName) =>
-      callAction('undo', opportunityId, { priorAction }),
-    [callAction]
-  );
-
-  return {
-    recover,
-    handleMyself,
-    ignore,
-    notACustomer,
-    undo,
-    isPending: (id: string) => state.pendingIds.has(id),
-    errorFor: (id: string) => state.errorByOpportunity[id],
-  };
+interface ToastContextValue {
+  push: (message: string, opts?: { tone?: ToastItem['tone']; action?: ToastAction; durationMs?: number }) => void;
 }
-```
 
-## 5. `components/recovery/PriorityBadge.tsx`
+const ToastContext = createContext<ToastContextValue | null>(null);
 
-```tsx
-// components/recovery/PriorityBadge.tsx
-import { PriorityLevel } from '@/types/opportunity';
+export function useToast() {
+  const ctx = useContext(ToastContext);
+  if (!ctx) throw new Error('useToast must be used within ToastProvider');
+  return ctx;
+}
 
-const LABELS: Record<PriorityLevel, string> = {
-  high: 'High priority',
-  worth_checking: 'Worth checking',
-  low: 'Low priority',
-};
+export function ToastProvider({ children }: { children: ReactNode }) {
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const timers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
-const DOT_CLASS: Record<PriorityLevel, string> = {
-  high: 'bg-rose-500',
-  worth_checking: 'bg-amber-500',
-  low: 'bg-slate-400',
-};
+  const dismiss = useCallback((id: string) => {
+    setToasts((t) => t.filter((x) => x.id !== id));
+    clearTimeout(timers.current[id]);
+    delete timers.current[id];
+  }, []);
 
-export function PriorityBadge({ level }: { level: PriorityLevel }) {
+  const push = useCallback<ToastContextValue['push']>((message, opts) => {
+    const id = crypto.randomUUID();
+    setToasts((t) => [...t, { id, message, tone: opts?.tone ?? 'neutral', action: opts?.action }]);
+    timers.current[id] = setTimeout(() => dismiss(id), opts?.durationMs ?? 5000);
+  }, [dismiss]);
+
   return (
-    <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-600">
-      <span
-        aria-hidden="true"
-        className={`h-1.5 w-1.5 rounded-full ${DOT_CLASS[level]}`}
-      />
-      {LABELS[level]}
-    </span>
+    <ToastContext.Provider value={{ push }}>
+      {children}
+      <div
+        aria-live="polite"
+        aria-atomic="true"
+        className="fixed inset-x-0 bottom-4 z-50 flex flex-col items-center gap-2 px-4"
+      >
+        {toasts.map((t) => (
+          <div
+            key={t.id}
+            role="status"
+            className={[
+              'flex w-full max-w-sm items-center justify-between gap-3 rounded-xl px-4 py-3 shadow-lg text-sm',
+              t.tone === 'error'
+                ? 'bg-red-600 text-white'
+                : t.tone === 'success'
+                ? 'bg-neutral-900 text-white'
+                : 'bg-neutral-900 text-white',
+            ].join(' ')}
+          >
+            <span>{t.message}</span>
+            {t.action && (
+              <button
+                onClick={() => {
+                  t.action?.onClick();
+                  dismiss(t.id);
+                }}
+                className="shrink-0 font-medium underline underline-offset-2 min-h-[44px] px-2 -my-3"
+              >
+                {t.action.label}
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    </ToastContext.Provider>
   );
 }
 ```
 
-## 6. `components/recovery/ChannelIcons.tsx`
+## Confirm Dialog
 
 ```tsx
-// components/recovery/ChannelIcons.tsx
-import { Phone, MessageCircle, Globe, Mail, MessageSquare } from 'lucide-react';
-import { ChannelType } from '@/types/opportunity';
+// components/recovery/ConfirmDialog.tsx
+'use client';
 
-const ICONS: Record<ChannelType, React.ComponentType<{ className?: string }>> = {
-  phone: Phone,
-  whatsapp: MessageCircle,
-  website: Globe,
-  email: Mail,
-  sms: MessageSquare,
-};
+import { useEffect, useRef } from 'react';
 
-export function ChannelIcons({ channels }: { channels: ChannelType[] }) {
-  if (!channels?.length) return null;
+interface ConfirmDialogProps {
+  open: boolean;
+  title: string;
+  confirmLabel: string;
+  cancelLabel?: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}
+
+export function ConfirmDialog({
+  open,
+  title,
+  confirmLabel,
+  cancelLabel = 'Cancel',
+  onConfirm,
+  onCancel,
+}: ConfirmDialogProps) {
+  const confirmRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (open) confirmRef.current?.focus();
+  }, [open]);
+
+  if (!open) return null;
+
   return (
-    <div className="flex items-center gap-1.5 text-slate-400" aria-label={`Contacted via ${channels.join(', ')}`}>
-      {channels.map((c) => {
-        const Icon = ICONS[c];
-        return <Icon key={c} className="h-3.5 w-3.5" aria-hidden="true" />;
-      })}
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="confirm-dialog-title"
+      className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 sm:items-center"
+      onKeyDown={(e) => e.key === 'Escape' && onCancel()}
+    >
+      <div className="w-full max-w-sm rounded-t-2xl bg-white p-5 shadow-xl sm:rounded-2xl">
+        <h2 id="confirm-dialog-title" className="text-base font-medium text-neutral-900">
+          {title}
+        </h2>
+        <div className="mt-5 flex gap-3">
+          <button
+            onClick={onCancel}
+            className="min-h-[44px] flex-1 rounded-xl border border-neutral-200 text-sm font-medium text-neutral-700"
+          >
+            {cancelLabel}
+          </button>
+          <button
+            ref={confirmRef}
+            onClick={onConfirm}
+            className="min-h-[44px] flex-1 rounded-xl bg-neutral-900 text-sm font-medium text-white"
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
 ```
 
-## 7. `components/recovery/OpportunityCard.tsx`
-
-The core UI element (sec. 12–20, 31–33, 39–41, 62, 71–74).
+## Opportunity Card
 
 ```tsx
 // components/recovery/OpportunityCard.tsx
 'use client';
 
-import { useState } from 'react';
-import { Opportunity } from '@/types/opportunity';
-import { PriorityBadge } from './PriorityBadge';
-import { ChannelIcons } from './ChannelIcons';
-import { useRecoveryActions } from '@/hooks/useRecoveryActions';
-import { AlertCircle, Loader2, ChevronRight } from 'lucide-react';
+import { useState, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
+import type { OpportunityDoc } from '@/types/opportunity';
+import { statusToHumanLabel } from '@/types/opportunity';
+import { recoverOpportunity, ignoreOpportunity, markNotACustomer } from '@/lib/firebase/recoveryActions';
+import { useToast } from './Toast';
+import { ConfirmDialog } from './ConfirmDialog';
+
+const CHANNEL_ICON: Record<string, string> = {
+  phone: '📞',
+  whatsapp: '💬',
+  website: '🌐',
+  sms: '✉️',
+  email: '✉️',
+  other: '•',
+};
+
+const PRIORITY_LABEL: Record<OpportunityDoc['priorityBand'], string> = {
+  high: 'High priority',
+  worth_checking: 'Worth checking',
+  low: 'Low priority',
+};
 
 interface OpportunityCardProps {
-  opportunity: Opportunity;
-  businessId: string;
+  opportunity: OpportunityDoc;
 }
 
-function timeAgo(ts: number): string {
-  const diffMs = Date.now() - ts;
-  const mins = Math.round(diffMs / 60000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
-  const hrs = Math.round(mins / 60);
-  if (hrs < 24) return `${hrs} hour${hrs === 1 ? '' : 's'} ago`;
-  const days = Math.round(hrs / 24);
-  return `${days} day${days === 1 ? '' : 's'} ago`;
-}
-
-export function OpportunityCard({ opportunity, businessId }: OpportunityCardProps) {
+export function OpportunityCard({ opportunity: o }: OpportunityCardProps) {
   const router = useRouter();
-  const actions = useRecoveryActions(businessId);
-  const [showPreview, setShowPreview] = useState(false);
-  const [editedMessage, setEditedMessage] = useState(
-    opportunity.recovery_preview?.message ?? ''
-  );
-  const [dismissed, setDismissed] = useState<null | 'ignore' | 'not_a_customer'>(null);
+  const { push: toast } = useToast();
+  const [isPending, startTransition] = useTransition();
+  const [localState, setLocalState] = useState<'idle' | 'recovering' | 'sent'>('idle');
+  const [confirmIgnore, setConfirmIgnore] = useState(false);
+  const [failed, setFailed] = useState(false);
 
-  const pending = actions.isPending(opportunity.id);
-  const actionError = actions.errorFor(opportunity.id);
+  const isRecovering = localState === 'recovering' || o.status === 'RECOVERY_SENT' || o.status === 'WAITING';
+  const isHumanRequired = o.decisionBand === 'human_required';
+  const isResponded = o.status === 'CUSTOMER_RESPONDED' || o.status === 'PROGRESSING';
+  const isBooked = o.status === 'BOOKED' || o.status === 'WON';
 
-  const goToConversation = () => router.push(`/conversations/${opportunity.customer_id}`);
-
-  const handleRecoverClick = async () => {
-    if (opportunity.recovery_preview?.requires_confirmation) {
-      setShowPreview(true);
-      return;
-    }
-    await actions.recover({ opportunityId: opportunity.id, businessId });
-  };
-
-  const confirmSend = async () => {
-    setShowPreview(false);
-    await actions.recover({
-      opportunityId: opportunity.id,
-      businessId,
-      editedMessage,
+  const handleRecover = () => {
+    setFailed(false);
+    setLocalState('recovering');
+    startTransition(async () => {
+      const result = await recoverOpportunity(o.id);
+      if (result.ok) {
+        setLocalState('sent');
+        toast(`Follow-up sent to ${o.customerName.split(' ')[0]}.`, { tone: 'success' });
+      } else {
+        setLocalState('idle');
+        setFailed(true);
+        toast(result.reason ?? "We couldn't send that message.", {
+          tone: 'error',
+          action: { label: 'Try again', onClick: handleRecover },
+        });
+      }
     });
   };
 
-  const handleIgnore = async () => {
-    const result = await actions.ignore(opportunity.id);
-    if (result.ok) setDismissed('ignore');
+  const handleMyself = () => {
+    router.push(`/conversations/${o.customerId}?opportunityId=${o.id}`);
   };
 
-  const handleNotACustomer = async () => {
-    const result = await actions.notACustomer(opportunity.id);
-    if (result.ok) setDismissed('not_a_customer');
+  const handleIgnore = () => {
+    setConfirmIgnore(false);
+    startTransition(async () => {
+      const result = await ignoreOpportunity(o.id);
+      if (result.ok) {
+        toast('Removed from recovery.', {
+          action: { label: 'Undo', onClick: () => undo(o.id) },
+        });
+      } else {
+        toast(result.reason ?? "Couldn't do that right now.", { tone: 'error' });
+      }
+    });
   };
 
-  const handleUndo = async () => {
-    if (!dismissed) return;
-    const result = await actions.undo(opportunity.id, dismissed as any);
-    if (result.ok) setDismissed(null);
+  const handleNotACustomer = () => {
+    startTransition(async () => {
+      const result = await markNotACustomer(o.id);
+      if (result.ok) {
+        toast('Marked as not a customer.', {
+          action: { label: 'Undo', onClick: () => undo(o.id) },
+        });
+      } else {
+        toast(result.reason ?? "Couldn't do that right now.", { tone: 'error' });
+      }
+    });
   };
 
-  // --- Dismissed (undo) state ---
-  if (dismissed) {
-    return (
-      <div
-        role="status"
-        className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-500"
-      >
-        <span>
-          {dismissed === 'ignore' ? 'Marked as ignored.' : 'Marked as not a customer.'}
-        </span>
-        <button
-          onClick={handleUndo}
-          className="font-medium text-slate-700 underline-offset-2 hover:underline"
-        >
-          Undo
-        </button>
-      </div>
-    );
-  }
+  const undo = async (opportunityId: string) => {
+    const { undoAction } = await import('@/lib/firebase/recoveryActions');
+    await undoAction(opportunityId);
+  };
 
-  // --- Blocked / needs-info state (sec 31–32, 89) ---
-  if (opportunity.needs_owner && opportunity.blocked_reason) {
-    return (
-      <article
-        aria-label={`${opportunity.customer_name}. Needs you. ${opportunity.blocked_reason}`}
-        className="rounded-xl border border-amber-200 bg-amber-50/60 p-4 sm:p-5"
-      >
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <h3 className="font-semibold text-slate-900">{opportunity.customer_name} needs you</h3>
-            <p className="mt-1 text-sm text-slate-600">{opportunity.blocked_reason}</p>
-          </div>
-          <ChannelIcons channels={opportunity.source_channels} />
-        </div>
-        <button
-          onClick={goToConversation}
-          className="mt-3 inline-flex items-center gap-1 rounded-lg bg-slate-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-900 focus-visible:ring-offset-2"
-        >
-          Handle myself
-        </button>
-      </article>
-    );
-  }
-
-  // --- Already recovering / waiting state (sec 71) ---
-  const isWaiting = opportunity.risk_state === 'RECOVERY_SENT' || opportunity.risk_state === 'WAITING';
-  const customerResponded = opportunity.risk_state === 'CUSTOMER_RESPONDED';
-
-  const srLabel = `${opportunity.customer_name}. ${
-    opportunity.priority === 'high' ? 'High priority.' : opportunity.priority === 'worth_checking' ? 'Worth checking.' : 'Low priority.'
-  } ${opportunity.why_now} Isolynic recommends: ${opportunity.recommendation}.`;
+  const primaryButtonLabel = isRecovering
+    ? localState === 'recovering'
+      ? 'Recovering…'
+      : 'Following up'
+    : isResponded
+    ? 'Continue'
+    : 'Recover';
 
   return (
     <article
-      aria-label={srLabel}
-      className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition-shadow hover:shadow-md sm:p-5"
+      aria-label={`${o.customerName}. ${PRIORITY_LABEL[o.priorityBand]}. ${o.whyNow} Isolynic recommends: ${o.recommendation}.`}
+      className="rounded-2xl border border-neutral-200 bg-white p-4 sm:p-5 shadow-sm transition-shadow hover:shadow-md"
     >
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
+        {/* Who / What / Why */}
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <h3 className="font-semibold text-slate-900">{opportunity.customer_name}</h3>
-            <PriorityBadge level={opportunity.priority} />
-            <ChannelIcons channels={opportunity.source_channels} />
+          <div className="flex items-center gap-2">
+            <h3 className="truncate text-base font-semibold text-neutral-900">{o.customerName}</h3>
+            {o.priorityBand !== 'low' && (
+              <span
+                className={[
+                  'shrink-0 rounded-full px-2 py-0.5 text-xs font-medium',
+                  o.priorityBand === 'high'
+                    ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                    : 'bg-neutral-100 text-neutral-700 border border-neutral-200',
+                ].join(' ')}
+              >
+                {PRIORITY_LABEL[o.priorityBand]}
+              </span>
+            )}
+            {o.sourceChannels.map((c) => (
+              <span key={c} aria-hidden="true" className="text-xs text-neutral-400">
+                {CHANNEL_ICON[c] ?? '•'}
+              </span>
+            ))}
           </div>
 
-          <p className="mt-1.5 text-sm text-slate-700">{opportunity.intent_summary}</p>
+          <p className="mt-1 text-sm text-neutral-700">{o.intentSummary}</p>
 
-          {customerResponded ? (
-            <p className="mt-1 text-sm font-medium text-emerald-700">
-              {opportunity.customer_name.split(' ')[0]} replied
-            </p>
-          ) : isWaiting ? (
-            <p className="mt-1 text-sm text-slate-500">
-              Follow-up sent {timeAgo(opportunity.updatedAt)} · Waiting for a reply
+          {isHumanRequired && o.needsOwnerReason ? (
+            <p className="mt-2 rounded-lg bg-neutral-50 px-3 py-2 text-sm text-neutral-800">
+              {o.needsOwnerReason}
             </p>
           ) : (
             <>
-              <p className="mt-2 text-sm text-slate-500">
-                <span className="font-medium text-slate-600">Why now: </span>
-                {opportunity.why_now}
-              </p>
-              <p className="mt-1 text-sm text-slate-500">
-                <span className="font-medium text-slate-600">Isolynic recommends: </span>
-                {opportunity.recommendation}
+              <p className="mt-2 text-sm text-neutral-500">{o.whyNow}</p>
+              <p className="mt-2 text-sm text-neutral-900">
+                <span className="font-medium">Isolynic recommends:</span> {o.recommendation}
               </p>
             </>
           )}
 
-          {actionError && (
-            <div className="mt-2 flex items-center gap-1.5 text-sm text-rose-600">
-              <AlertCircle className="h-4 w-4" aria-hidden="true" />
-              <span>{actionError}</span>
-            </div>
+          {isRecovering && localState !== 'idle' && (
+            <p className="mt-2 text-sm text-neutral-500">
+              {localState === 'sent' || o.status === 'RECOVERY_SENT' || o.status === 'WAITING'
+                ? 'Waiting for a response.'
+                : 'Sending…'}
+            </p>
+          )}
+
+          {o.handledByName && (
+            <p className="mt-2 text-xs text-neutral-400">{o.handledByName} is handling this customer.</p>
           )}
         </div>
 
-        <div className="flex shrink-0 flex-row gap-2 sm:flex-col sm:items-stretch">
-          {!isWaiting && !customerResponded && (
+        {/* Actions */}
+        <div className="flex shrink-0 flex-row gap-2 sm:flex-col sm:items-stretch sm:w-40">
+          {!isHumanRequired && !isBooked && (
             <button
-              onClick={handleRecoverClick}
-              disabled={pending}
-              className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-900 focus-visible:ring-offset-2"
-              aria-label={`Recover ${opportunity.customer_name}`}
+              onClick={handleRecover}
+              disabled={isPending || isRecovering}
+              className="min-h-[44px] flex-1 rounded-xl bg-neutral-900 px-4 text-sm font-medium text-white disabled:opacity-60 sm:flex-none"
             >
-              {pending ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                  Recovering…
-                </>
-              ) : (
-                'Recover'
-              )}
+              {primaryButtonLabel}
             </button>
           )}
-
-          {customerResponded && (
+          {!isBooked && (
             <button
-              onClick={goToConversation}
-              className="inline-flex items-center justify-center gap-1 rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
+              onClick={handleMyself}
+              className="min-h-[44px] flex-1 rounded-xl border border-neutral-200 px-4 text-sm font-medium text-neutral-800 sm:flex-none"
             >
-              Continue <ChevronRight className="h-4 w-4" aria-hidden="true" />
+              Handle myself
             </button>
           )}
-
-          <button
-            onClick={goToConversation}
-            className="rounded-lg border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
-          >
-            Handle myself
-          </button>
-
-          {!isWaiting && !customerResponded && (
-            <div className="flex gap-2 sm:hidden">
+          {!isHumanRequired && !isResponded && !isBooked && (
+            <div className="hidden sm:flex sm:gap-2">
               <button
-                onClick={handleNotACustomer}
-                className="flex-1 rounded-lg px-3 py-1.5 text-xs text-slate-400 hover:text-slate-600"
-              >
-                Not a customer
-              </button>
-              <button
-                onClick={handleIgnore}
-                className="flex-1 rounded-lg px-3 py-1.5 text-xs text-slate-400 hover:text-slate-600"
+                onClick={() => setConfirmIgnore(true)}
+                className="min-h-[44px] flex-1 rounded-xl px-2 text-xs font-medium text-neutral-400 hover:text-neutral-600"
               >
                 Ignore
+              </button>
+              <button
+                onClick={handleNotACustomer}
+                className="min-h-[44px] flex-1 rounded-xl px-2 text-xs font-medium text-neutral-400 hover:text-neutral-600"
+              >
+                Not a customer
               </button>
             </div>
           )}
         </div>
       </div>
 
-      {!isWaiting && !customerResponded && (
-        <div className="mt-3 hidden gap-4 border-t border-slate-100 pt-2.5 sm:flex">
-          <button
-            onClick={handleNotACustomer}
-            className="text-xs text-slate-400 hover:text-slate-600"
-          >
-            Not a customer
-          </button>
-          <button
-            onClick={handleIgnore}
-            className="text-xs text-slate-400 hover:text-slate-600"
-          >
-            Ignore
-          </button>
-        </div>
-      )}
-
-      {showPreview && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-label={`Confirm recovery message to ${opportunity.customer_name}`}
-          className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3.5"
-        >
-          <p className="mb-2 text-xs font-medium text-slate-500">Isolynic would send:</p>
-          <textarea
-            value={editedMessage}
-            onChange={(e) => setEditedMessage(e.target.value)}
-            rows={3}
-            className="w-full rounded-md border border-slate-200 bg-white p-2 text-sm text-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
-          />
-          <div className="mt-2.5 flex justify-end gap-2">
-            <button
-              onClick={() => setShowPreview(false)}
-              className="rounded-lg px-3.5 py-1.5 text-sm text-slate-600 hover:bg-slate-100"
-            >
-              Cancel
-            </button>
-            <button
-              onClick={confirmSend}
-              disabled={pending}
-              className="rounded-lg bg-slate-900 px-3.5 py-1.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-60"
-            >
-              Send
-            </button>
-          </div>
-        </div>
-      )}
+      <ConfirmDialog
+        open={confirmIgnore}
+        title={`Don't recover ${o.customerName.split(' ')[0]}?`}
+        confirmLabel="Yes, ignore"
+        onConfirm={handleIgnore}
+        onCancel={() => setConfirmIgnore(false)}
+      />
     </article>
   );
 }
 ```
 
-## 8. `components/recovery/QueueSummary.tsx`
+## Queue Summary, Filters, Empty State, Recently Recovered, Skeleton, Banners
 
 ```tsx
 // components/recovery/QueueSummary.tsx
-interface QueueSummaryProps {
-  totalActive: number;
-  autoHandledCount: number;
-  needsYouCount: number;
+import type { OpportunityDoc } from '@/types/opportunity';
+
+function pluralize(n: number, word: string) {
+  return `${n} ${word}${n === 1 ? '' : 's'}`;
 }
 
-function headline(total: number): string {
-  if (total === 0) return "You're all caught up";
-  if (total === 1) return '1 customer may be slipping away';
-  return `${total} customers may need attention`;
-}
+export function QueueSummary({ active }: { active: OpportunityDoc[] }) {
+  const total = active.length;
+  const autonomous = active.filter((o) => o.decisionBand !== 'human_required').length;
+  const needsYou = total - autonomous;
 
-export function QueueSummary({ totalActive, autoHandledCount, needsYouCount }: QueueSummaryProps) {
-  if (totalActive === 0) return null;
+  if (total === 0) return null;
+
   return (
-    <div className="px-1">
-      <h2 className="text-lg font-semibold text-slate-900 sm:text-xl">
-        {headline(totalActive)}
-      </h2>
-      {(autoHandledCount > 0 || needsYouCount > 0) && (
-        <p className="mt-0.5 text-sm text-slate-500">
-          {autoHandledCount > 0 && `${autoHandledCount} can be handled automatically.`}{' '}
-          {needsYouCount > 0 && `${needsYouCount} may need you.`}
+    <div className="mb-1">
+      <h1 className="text-xl font-semibold text-neutral-900">
+        {pluralize(total, 'customer')} may be slipping away
+      </h1>
+      {autonomous > 0 && needsYou > 0 && (
+        <p className="mt-1 text-sm text-neutral-500">
+          {pluralize(autonomous, 'can be')} handled automatically. {pluralize(needsYou, 'may need you')}.
         </p>
       )}
     </div>
@@ -817,16 +800,14 @@ export function QueueSummary({ totalActive, autoHandledCount, needsYouCount }: Q
 }
 ```
 
-## 9. `components/recovery/PriorityFilterTabs.tsx`
-
 ```tsx
 // components/recovery/PriorityFilterTabs.tsx
-import { QueueFilter } from '@/types/opportunity';
+import type { QueueFilter } from '@/hooks/useRecoveryQueue';
 
-const TABS: { key: QueueFilter; label: string }[] = [
-  { key: 'all', label: 'All' },
-  { key: 'needs_you', label: 'Needs you' },
-  { key: 'handled', label: 'Handled' },
+const TABS: { id: QueueFilter; label: string }[] = [
+  { id: 'all', label: 'All' },
+  { id: 'needs_you', label: 'Needs you' },
+  { id: 'handled', label: 'Handled' },
 ];
 
 export function PriorityFilterTabs({
@@ -837,18 +818,17 @@ export function PriorityFilterTabs({
   onChange: (v: QueueFilter) => void;
 }) {
   return (
-    <div role="tablist" aria-label="Filter recovery queue" className="flex gap-1 rounded-lg bg-slate-100 p-1">
+    <div role="tablist" aria-label="Filter recovery queue" className="flex gap-1 rounded-full bg-neutral-100 p-1">
       {TABS.map((tab) => (
         <button
-          key={tab.key}
+          key={tab.id}
           role="tab"
-          aria-selected={value === tab.key}
-          onClick={() => onChange(tab.key)}
-          className={`rounded-md px-3.5 py-1.5 text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 ${
-            value === tab.key
-              ? 'bg-white text-slate-900 shadow-sm'
-              : 'text-slate-500 hover:text-slate-700'
-          }`}
+          aria-selected={value === tab.id}
+          onClick={() => onChange(tab.id)}
+          className={[
+            'min-h-[36px] flex-1 rounded-full px-3 text-sm font-medium transition-colors',
+            value === tab.id ? 'bg-white text-neutral-900 shadow-sm' : 'text-neutral-500',
+          ].join(' ')}
         >
           {tab.label}
         </button>
@@ -858,22 +838,20 @@ export function PriorityFilterTabs({
 }
 ```
 
-## 10. `components/recovery/EmptyState.tsx`
-
 ```tsx
 // components/recovery/EmptyState.tsx
-import { CheckCircle2 } from 'lucide-react';
-
 export function EmptyState({ handledThisWeek }: { handledThisWeek?: number }) {
   return (
-    <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-slate-200 bg-slate-50/50 px-6 py-16 text-center">
-      <CheckCircle2 className="h-10 w-10 text-emerald-500" aria-hidden="true" />
-      <h2 className="mt-4 text-lg font-semibold text-slate-900">You're all caught up.</h2>
-      <p className="mt-1.5 max-w-sm text-sm text-slate-500">
+    <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-neutral-200 px-6 py-16 text-center">
+      <div aria-hidden="true" className="mb-4 h-12 w-12 rounded-full bg-emerald-50 flex items-center justify-center text-2xl">
+        ✓
+      </div>
+      <h2 className="text-base font-semibold text-neutral-900">You're all caught up.</h2>
+      <p className="mt-1 max-w-xs text-sm text-neutral-500">
         Isolynic isn't seeing any customers that need attention right now.
       </p>
-      {typeof handledThisWeek === 'number' && (
-        <p className="mt-4 text-xs text-slate-400">
+      {typeof handledThisWeek === 'number' && handledThisWeek > 0 && (
+        <p className="mt-3 text-xs text-neutral-400">
           {handledThisWeek} customer conversations handled this week.
         </p>
       )}
@@ -882,24 +860,30 @@ export function EmptyState({ handledThisWeek }: { handledThisWeek?: number }) {
 }
 ```
 
-## 11. `components/recovery/RecentlyRecovered.tsx`
-
 ```tsx
-// components/recovery/RecentlyRecovered.tsx
-import { RecoveredEntry } from '@/types/opportunity';
+// components/recovery/RecentlyRecoveredList.tsx
+import type { OpportunityDoc } from '@/types/opportunity';
 
-export function RecentlyRecovered({ items }: { items: RecoveredEntry[] }) {
-  if (!items.length) return null;
+function outcomeText(o: OpportunityDoc): string {
+  if (o.outcomeNote) return o.outcomeNote;
+  if (o.outcome === 'booked') return 'Appointment booked.';
+  if (o.outcome === 'won') return 'Customer returned after follow-up.';
+  return 'Customer replied.';
+}
+
+export function RecentlyRecoveredList({ items }: { items: OpportunityDoc[] }) {
+  if (items.length === 0) return null;
+
   return (
     <section aria-labelledby="recently-recovered-heading" className="mt-8">
-      <h2 id="recently-recovered-heading" className="mb-2 text-sm font-medium text-slate-500">
+      <h2 id="recently-recovered-heading" className="text-sm font-medium text-neutral-500">
         Recently recovered
       </h2>
-      <ul className="divide-y divide-slate-100 rounded-xl border border-slate-100 bg-white">
-        {items.map((item) => (
-          <li key={item.id} className="flex items-center justify-between px-4 py-2.5">
-            <span className="text-sm font-medium text-slate-700">{item.customer_name}</span>
-            <span className="text-sm text-slate-400">{item.outcome_text}</span>
+      <ul className="mt-2 divide-y divide-neutral-100 rounded-2xl border border-neutral-100">
+        {items.map((o) => (
+          <li key={o.id} className="flex items-center justify-between px-4 py-3">
+            <span className="text-sm font-medium text-neutral-800">{o.customerName}</span>
+            <span className="text-sm text-neutral-500">{outcomeText(o)}</span>
           </li>
         ))}
       </ul>
@@ -908,22 +892,17 @@ export function RecentlyRecovered({ items }: { items: RecoveredEntry[] }) {
 }
 ```
 
-## 12. `components/recovery/QueueSkeleton.tsx`
-
 ```tsx
 // components/recovery/QueueSkeleton.tsx
 export function QueueSkeleton() {
   return (
-    <div aria-live="polite" aria-label="Checking your customers…" className="space-y-3">
+    <div aria-label="Checking your customers…" role="status" className="space-y-3">
       {[0, 1, 2].map((i) => (
-        <div
-          key={i}
-          className="animate-pulse rounded-xl border border-slate-200 bg-white p-4 sm:p-5"
-        >
-          <div className="h-4 w-1/3 rounded bg-slate-200" />
-          <div className="mt-3 h-3 w-2/3 rounded bg-slate-100" />
-          <div className="mt-2 h-3 w-1/2 rounded bg-slate-100" />
-          <div className="mt-4 h-8 w-24 rounded-lg bg-slate-200" />
+        <div key={i} className="animate-pulse rounded-2xl border border-neutral-100 p-4 sm:p-5">
+          <div className="h-4 w-1/3 rounded bg-neutral-100" />
+          <div className="mt-3 h-3 w-2/3 rounded bg-neutral-100" />
+          <div className="mt-2 h-3 w-1/2 rounded bg-neutral-100" />
+          <div className="mt-4 h-9 w-24 rounded-xl bg-neutral-100" />
         </div>
       ))}
     </div>
@@ -931,230 +910,201 @@ export function QueueSkeleton() {
 }
 ```
 
-## 13. `app/recovery/page.tsx`
-
-The screen itself — assembles everything, handles the stale/offline banner (sec. 50), the new-event banner (sec. 25), header (sec. 7), and nav badge count logic feed (sec. 65).
-
 ```tsx
-// app/recovery/page.tsx
-'use client';
-
-import { useState, useEffect, useRef } from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
-import { Search, SlidersHorizontal, WifiOff, RefreshCw, ChevronUp } from 'lucide-react';
-import { useRecoveryQueue } from '@/hooks/useRecoveryQueue';
-import { QueueSummary } from '@/components/recovery/QueueSummary';
-import { PriorityFilterTabs } from '@/components/recovery/PriorityFilterTabs';
-import { OpportunityCard } from '@/components/recovery/OpportunityCard';
-import { EmptyState } from '@/components/recovery/EmptyState';
-import { RecentlyRecovered } from '@/components/recovery/RecentlyRecovered';
-import { QueueSkeleton } from '@/components/recovery/QueueSkeleton';
-import { QueueFilter } from '@/types/opportunity';
-import { useAuth } from '@/hooks/useAuth'; // assumed existing auth hook providing businessId
-
-export default function RecoveryQueuePage() {
-  const router = useRouter();
-  const searchParams = useSearchParams();
-  const { businessId } = useAuth();
-
-  const initialFilter = (searchParams.get('filter') as QueueFilter) || 'all';
-  const [filter, setFilter] = useState<QueueFilter>(initialFilter);
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [searchTerm, setSearchTerm] = useState('');
-  const [newItemBanner, setNewItemBanner] = useState(false);
-
-  const {
-    opportunities,
-    recentlyRecovered,
-    loading,
-    isStale,
-    error,
-    isOffline,
-    retry,
-    needsYouCount,
-    autoHandledCount,
-  } = useRecoveryQueue(businessId, filter);
-
-  const prevCountRef = useRef<number>(opportunities.length);
-  useEffect(() => {
-    if (opportunities.length > prevCountRef.current) {
-      setNewItemBanner(true);
-    }
-    prevCountRef.current = opportunities.length;
-  }, [opportunities.length]);
-
-  const visibleOpportunities = searchTerm.trim()
-    ? opportunities.filter((o) =>
-        [o.customer_name, o.customer_id]
-          .join(' ')
-          .toLowerCase()
-          .includes(searchTerm.trim().toLowerCase())
-      )
-    : opportunities;
-
-  const handleFilterChange = (f: QueueFilter) => {
-    setFilter(f);
-    router.replace(`/recovery?filter=${f}`);
-  };
-
+// components/recovery/Banners.tsx
+export function NewOpportunityBanner({ onView, onDismiss }: { onView: () => void; onDismiss: () => void }) {
   return (
-    <div className="mx-auto w-full max-w-[1200px] px-4 pb-16 pt-6 sm:px-6 lg:px-8">
-      {/* Region A — Header */}
-      <header className="flex items-center justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">Recovery</h1>
-          <p className="text-sm text-slate-500">Customers who may need saving</p>
-        </div>
-        <div className="flex items-center gap-1.5">
-          {opportunities.length > 8 && (
-            <button
-              onClick={() => setSearchOpen((s) => !s)}
-              aria-label="Search customers"
-              className="rounded-lg p-2 text-slate-500 hover:bg-slate-100"
-            >
-              <Search className="h-5 w-5" aria-hidden="true" />
-            </button>
-          )}
-          <button
-            aria-label="Filter"
-            className="rounded-lg p-2 text-slate-500 hover:bg-slate-100 sm:hidden"
-          >
-            <SlidersHorizontal className="h-5 w-5" aria-hidden="true" />
-          </button>
-        </div>
-      </header>
-
-      {searchOpen && (
-        <div className="mt-3">
-          <input
-            type="search"
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            placeholder="Search customers"
-            className="w-full rounded-lg border border-slate-200 px-3.5 py-2 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
-            autoFocus
-          />
-        </div>
-      )}
-
-      {/* Offline / stale banner (sec 50-51) */}
-      {(isOffline || isStale) && (
-        <div className="mt-4 flex items-center justify-between rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-sm text-amber-800">
-          <span className="flex items-center gap-2">
-            <WifiOff className="h-4 w-4" aria-hidden="true" />
-            {isOffline
-              ? "You're offline. Showing your last results."
-              : error ?? 'Updated recently'}
-          </span>
-          {!isOffline && (
-            <button onClick={retry} className="flex items-center gap-1 font-medium hover:underline">
-              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
-              Try again
-            </button>
-          )}
-        </div>
-      )}
-
-      {/* New event banner (sec 25) */}
-      {newItemBanner && !loading && (
-        <button
-          onClick={() => setNewItemBanner(false)}
-          className="mt-4 flex w-full items-center justify-between rounded-lg bg-slate-900 px-3.5 py-2.5 text-sm text-white"
-        >
-          <span className="flex items-center gap-1.5">
-            <ChevronUp className="h-4 w-4" aria-hidden="true" />1 new customer may need attention
-          </span>
-          <span className="font-medium underline underline-offset-2">View</span>
+    <div className="mb-3 flex items-center justify-between rounded-xl bg-neutral-50 border border-neutral-200 px-4 py-2.5 text-sm">
+      <span className="text-neutral-700">1 new customer may need attention</span>
+      <div className="flex items-center gap-3">
+        <button onClick={onView} className="font-medium text-neutral-900 underline underline-offset-2 min-h-[36px]">
+          View
         </button>
-      )}
-
-      <div className="mt-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <QueueSummary
-          totalActive={opportunities.length}
-          autoHandledCount={autoHandledCount}
-          needsYouCount={needsYouCount}
-        />
-        {opportunities.length > 0 && (
-          <PriorityFilterTabs value={filter} onChange={handleFilterChange} />
-        )}
+        <button onClick={onDismiss} aria-label="Dismiss" className="text-neutral-400 min-h-[36px] min-w-[36px]">
+          ✕
+        </button>
       </div>
+    </div>
+  );
+}
 
-      <main className="mt-5">
-        {loading ? (
-          <QueueSkeleton />
-        ) : visibleOpportunities.length === 0 ? (
-          <EmptyState handledThisWeek={undefined} />
-        ) : (
-          <div className="space-y-3">
-            {visibleOpportunities.map((opp) => (
-              <OpportunityCard key={opp.id} opportunity={opp} businessId={businessId} />
-            ))}
-          </div>
-        )}
-
-        <RecentlyRecovered items={recentlyRecovered} />
-      </main>
+export function OfflineBanner({ fromCache }: { fromCache: boolean }) {
+  return (
+    <div className="mb-3 rounded-xl bg-amber-50 border border-amber-200 px-4 py-2.5 text-sm text-amber-800">
+      We couldn't check for new customer activity. Your last results are still here.
+      {fromCache && <span className="text-amber-600"> (Updated recently)</span>}
     </div>
   );
 }
 ```
 
----
+## Page Assembly
 
-### Notes on backend responsibilities (Cloud Functions, not shown as code since these are server-side, not TSX)
+```tsx
+// app/recovery/page.tsx
+'use client';
 
-- `recoveryQueue-recover`, `-handle_myself`, `-ignore`, `-not_a_customer`, `-undo` should each: verify the caller owns `businessId`, look up the opportunity by `idempotencyKey` in a `recoveryActions` collection first (write-once), and only then mutate state — this is what actually enforces sec. 34's dedup guarantee; the client-side key alone isn't sufficient.
-- Priority score, evidence, and channel merging (secs 36, 42, 76) belong in a background function that writes `priority_score`/`priority` onto the opportunity doc — never computed client-side, since the formula must stay invisible per sec. 14/42.
-- The `Recover` action should never mark `message_sent = recovery_success` (sec. 22) — the function transitions `risk_state` to `RECOVERY_SENT`/`WAITING`, and only a later customer event moves it to `CUSTOMER_RESPONDED` or an outcome.
+import { useState } from 'react';
+import { useAuthedBusiness } from '@/hooks/useAuthedBusiness'; // returns { businessId } from session
+import { useRecoveryQueue, useFilteredQueue, useOnlineStatus, type QueueFilter } from '@/hooks/useRecoveryQueue';
+import { QueueSummary } from '@/components/recovery/QueueSummary';
+import { PriorityFilterTabs } from '@/components/recovery/PriorityFilterTabs';
+import { OpportunityCard } from '@/components/recovery/OpportunityCard';
+import { RecentlyRecoveredList } from '@/components/recovery/RecentlyRecoveredList';
+import { EmptyState } from '@/components/recovery/EmptyState';
+import { QueueSkeleton } from '@/components/recovery/QueueSkeleton';
+import { NewOpportunityBanner, OfflineBanner } from '@/components/recovery/Banners';
+import { ToastProvider } from '@/components/recovery/Toast';
 
-Want me to also write the Cloud Functions (Node/TypeScript) that back these five actions, or the Firestore security rules for the `opportunities` collection?
+function RecoveryQueueScreen() {
+  const { businessId } = useAuthedBusiness();
+  const [filter, setFilter] = useState<QueueFilter>('all');
+  const online = useOnlineStatus();
 
+  const { loading, errored, fromCache, active, recentlyRecovered, newlyArrivedId, dismissNewlyArrived } =
+    useRecoveryQueue(businessId);
 
+  const filtered = useFilteredQueue(active, filter);
 
+  return (
+    <main className="mx-auto w-full max-w-[1150px] px-4 py-6 sm:px-6 lg:px-8">
+      <header className="mb-5 flex items-center justify-between">
+        <div>
+          <p className="text-xs font-medium uppercase tracking-wide text-neutral-400">Recovery</p>
+          <p className="text-sm text-neutral-400">Customers who may need saving</p>
+        </div>
+      </header>
 
+      {!online && <OfflineBanner fromCache={fromCache} />}
+      {errored && (
+        <OfflineBanner fromCache={fromCache} />
+      )}
 
+      {newlyArrivedId && (
+        <NewOpportunityBanner
+          onView={() => {
+            document.getElementById(`opportunity-${newlyArrivedId}`)?.scrollIntoView({ behavior: 'smooth' });
+            dismissNewlyArrived();
+          }}
+          onDismiss={dismissNewlyArrived}
+        />
+      )}
 
+      <div className="mb-4">
+        <QueueSummary active={active} />
+      </div>
 
+      {active.length > 0 && (
+        <div className="mb-5 max-w-xs">
+          <PriorityFilterTabs value={filter} onChange={setFilter} />
+        </div>
+      )}
 
+      {loading ? (
+        <QueueSkeleton />
+      ) : filtered.length === 0 ? (
+        <EmptyState handledThisWeek={recentlyRecovered.length} />
+      ) : (
+        <div className="space-y-3">
+          {filtered.map((o) => (
+            <div id={`opportunity-${o.id}`} key={o.id}>
+              <OpportunityCard opportunity={o} />
+            </div>
+          ))}
+        </div>
+      )}
 
+      {filter === 'all' && <RecentlyRecoveredList items={recentlyRecovered} />}
+    </main>
+  );
+}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-CLOUD FUNCTIONS
-
-
-Here's the Cloud Functions v2 (Node 20, TypeScript) backend for the five Recovery Queue actions, with the idempotency, dedup, anti-spam, and ownership guarantees the spec calls out (secs. 17–20, 34, 35, 55–56, 62).
-
-## 1. `functions/src/types.ts`
+export default function RecoveryQueuePage() {
+  return (
+    <ToastProvider>
+      <RecoveryQueueScreen />
+    </ToastProvider>
+  );
+}
+```
 
 ```typescript
-// functions/src/types.ts
+// hooks/useAuthedBusiness.ts
+'use client';
 
-export type RiskState =
+import { useEffect, useState } from 'react';
+import { onAuthStateChanged } from 'firebase/auth';
+import { doc, onSnapshot } from 'firebase/firestore';
+import { auth, db } from '@/lib/firebase/client';
+
+export function useAuthedBusiness() {
+  const [uid, setUid] = useState<string | null>(null);
+  const [businessId, setBusinessId] = useState<string | null>(null);
+
+  useEffect(() => onAuthStateChanged(auth, (user) => setUid(user?.uid ?? null)), []);
+
+  useEffect(() => {
+    if (!uid) return;
+    return onSnapshot(doc(db, 'users', uid), (snap) => {
+      setBusinessId((snap.data()?.businessId as string) ?? null);
+    });
+  }, [uid]);
+
+  return { uid, businessId };
+}
+```
+
+---
+
+## Cloud Functions (v2, TypeScript)
+
+```typescript
+// functions/src/lib/priority.ts
+import type { PriorityBand, DecisionBand } from './types';
+
+interface ScoreInputs {
+  intentConfidence: number;      // 0–1
+  valueEstimate: number | null;  // currency, null if unknown
+  avgTransactionValue: number | null;
+  deteriorationRisk: number;     // 0–1
+  recoveryEffectiveness: number; // 0–1 estimated benefit of intervention
+}
+
+const DEFAULT_TRANSACTION_VALUE = 100;
+
+/** Recovery Priority = Intent × Value × Risk of Loss × Recovery Effectiveness (spec §11/§42). */
+export function computePriorityScore(inputs: ScoreInputs): number {
+  const value =
+    inputs.valueEstimate ?? inputs.avgTransactionValue ?? DEFAULT_TRANSACTION_VALUE;
+  const normalizedValue = Math.min(value / 1000, 1); // cap influence of very large values
+  const raw =
+    inputs.intentConfidence * 0.35 +
+    normalizedValue * 0.25 +
+    inputs.deteriorationRisk * 0.25 +
+    inputs.recoveryEffectiveness * 0.15;
+  return Math.round(raw * 1000) / 1000;
+}
+
+export function scoreToPriorityBand(score: number): PriorityBand {
+  if (score >= 0.65) return 'high';
+  if (score >= 0.35) return 'worth_checking';
+  return 'low';
+}
+
+export function scoreToDecisionBand(params: {
+  score: number;
+  hasRequiredPricingInfo: boolean;
+  isAmbiguousIntent: boolean;
+}): DecisionBand {
+  if (!params.hasRequiredPricingInfo || params.isAmbiguousIntent) return 'human_required';
+  if (params.score >= 0.65) return 'autonomous';
+  return 'assisted';
+}
+```
+
+```typescript
+// functions/src/lib/types.ts
+export type OpportunityLifecycleStatus =
   | 'NEW_RISK'
   | 'RECOVERY_RECOMMENDED'
   | 'OWNER_APPROVED'
@@ -1165,850 +1115,613 @@ export type RiskState =
   | 'BOOKED'
   | 'WON'
   | 'LOST'
-  | 'HANDLED';
+  | 'HANDLED'
+  | 'IGNORED'
+  | 'NOT_A_CUSTOMER';
 
-export type ChannelType = 'phone' | 'whatsapp' | 'website' | 'sms' | 'email';
-
-export type OwnerActionType = 'recover' | 'handle_myself' | 'ignore' | 'not_a_customer' | null;
+export type PriorityBand = 'high' | 'worth_checking' | 'low';
+export type DecisionBand = 'autonomous' | 'assisted' | 'human_required';
+export type ChannelType = 'phone' | 'whatsapp' | 'website' | 'sms' | 'email' | 'other';
 
 export interface EvidenceItem {
   id: string;
-  event_type: string;
+  eventType: string;
   timestamp: number;
   channel: ChannelType;
   summary: string;
-  relevance: number;
-}
-
-export interface PresenceInfo {
-  handled_by_uid: string;
-  handled_by_name: string;
-  handled_at: number;
+  relevance: 'primary' | 'supporting';
 }
 
 export interface OpportunityDoc {
+  id: string;
   businessId: string;
-  customer_id: string;
-  customer_name: string;
-  customer_phone?: string | null;
-  source_channels: ChannelType[];
-
-  first_contact_at: number;
-  latest_activity_at: number;
-
-  intent_summary: string;
-  why_now: string;
+  customerId: string;
+  customerName: string;
+  sourceChannels: ChannelType[];
+  firstContactAt: number;
+  latestActivityAt: number;
+  intentSummary: string;
+  whyNow: string;
   recommendation: string;
-
-  priority: 'high' | 'worth_checking' | 'low';
-  priority_score: number;
-
-  value_estimate?: number | null;
-
-  risk_state: RiskState;
-  status: 'active' | 'waiting' | 'responded' | 'resolved' | 'lost' | 'handled';
-
-  needs_owner: boolean;
-  blocked_reason?: string | null;
-
-  owner_action: OwnerActionType;
-  last_recovery_action_id?: string | null;
-  follow_up_count: number;
-  max_follow_ups: number;
-  next_review_at?: number | null;
-
-  cooldown_until?: number | null;
-  customer_opted_out?: boolean;
-  customer_rejected_at?: number | null;
-
+  valueEstimate?: number | null;
+  riskState: 'stable' | 'deteriorating' | 'critical';
+  status: OpportunityLifecycleStatus;
+  priorityBand: PriorityBand;
+  priorityScore: number;
+  decisionBand: DecisionBand;
+  ownerAction?: string | null;
+  lastRecoveryAction?: { type: string; at: number; channel: ChannelType; messagePreview?: string } | null;
+  followUpCount: number;
+  maxFollowUps: number;
+  cooldownUntil?: number | null;
+  explicitlyRejected?: boolean;
+  needsOwnerReason?: string | null;
+  handledByUid?: string | null;
+  handledByName?: string | null;
+  nextReviewAt?: number | null;
   evidence: EvidenceItem[];
-
-  outcome?: { type: 'booked' | 'won' | 'lost' | 'handled' | null; note?: string; at?: number } | null;
-
-  presence?: PresenceInfo | null;
-
-  recovery_preview?: { message: string; requires_confirmation: boolean } | null;
-
-  // Snapshot of state before the most recent dismissive action, used for Undo (sec 62)
-  pre_dismiss_snapshot?: Partial<OpportunityDoc> | null;
-
+  outcome?: 'booked' | 'won' | 'lost' | null;
+  outcomeNote?: string | null;
+  undoExpiresAt?: number | null;
+  priorSnapshot?: Partial<OpportunityDoc> | null;
   createdAt: number;
   updatedAt: number;
-}
-
-export interface RecoveryActionRecord {
-  idempotencyKey: string;
-  action: string;
-  opportunityId: string;
-  businessId: string;
-  uid: string;
-  status: 'succeeded' | 'failed';
-  result?: unknown;
-  error?: string;
-  createdAt: number;
-}
-
-export interface CallablePayload {
-  businessId: string;
-  opportunityId: string;
-  idempotencyKey: string;
+  version: number;
 }
 ```
-
-## 2. `functions/src/lib/admin.ts`
-
-```typescript
-// functions/src/lib/admin.ts
-import { initializeApp, getApps } from 'firebase-admin/app';
-import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
-
-if (!getApps().length) {
-  initializeApp();
-}
-
-export const db = getFirestore();
-export { FieldValue, Timestamp };
-```
-
-## 3. `functions/src/lib/errors.ts`
-
-```typescript
-// functions/src/lib/errors.ts
-import { HttpsError } from 'firebase-functions/v2/https';
-
-export function requireAuth(uid: string | undefined): asserts uid is string {
-  if (!uid) {
-    throw new HttpsError('unauthenticated', 'You must be signed in to do that.');
-  }
-}
-
-export function badRequest(message: string): never {
-  throw new HttpsError('invalid-argument', message);
-}
-
-export function forbidden(message = "You don't have access to this business."): never {
-  throw new HttpsError('permission-denied', message);
-}
-
-export function notFound(message = 'That customer opportunity no longer exists.'): never {
-  throw new HttpsError('not-found', message);
-}
-
-export function failedPrecondition(message: string): never {
-  throw new HttpsError('failed-precondition', message);
-}
-```
-
-## 4. `functions/src/lib/authz.ts`
-
-Verifies the caller actually belongs to the business before touching any opportunity — every callable uses this first (sec. 35, employee ownership; also basic multi-tenant safety).
-
-```typescript
-// functions/src/lib/authz.ts
-import { db } from './admin';
-import { forbidden } from './errors';
-
-interface MembershipInfo {
-  uid: string;
-  displayName: string;
-  role: 'owner' | 'staff';
-}
-
-export async function assertBusinessMember(
-  businessId: string,
-  uid: string
-): Promise<MembershipInfo> {
-  const memberSnap = await db
-    .collection('businesses')
-    .doc(businessId)
-    .collection('members')
-    .doc(uid)
-    .get();
-
-  if (!memberSnap.exists) {
-    forbidden();
-  }
-
-  const data = memberSnap.data()!;
-  return {
-    uid,
-    displayName: data.displayName ?? 'A teammate',
-    role: data.role ?? 'staff',
-  };
-}
-```
-
-## 5. `functions/src/lib/idempotency.ts`
-
-The core of sec. 34 — every recovery-affecting action must be idempotent regardless of retries, duplicate webhooks, or multiple simultaneous callers.
 
 ```typescript
 // functions/src/lib/idempotency.ts
-import { db, FieldValue } from './admin';
-import { HttpsError } from 'firebase-functions/v2/https';
-import { Firestore, Transaction } from 'firebase-admin/firestore';
+import { getFirestore, Transaction } from 'firebase-admin/firestore';
 
-const ACTIONS_COLLECTION = 'recoveryActions';
+const db = getFirestore();
 
 /**
- * Reserves an idempotency key inside the SAME transaction as the state
- * mutation it protects. If the key was already used, throws a benign
- * "already-exists" style error the caller can treat as a no-op success,
- * rather than re-running the side effect (e.g. sending a message twice).
+ * Ensures a client-supplied requestId is only ever processed once, guarding against
+ * duplicate webhooks, retried callable invocations, and multi-tab double-taps (spec §34).
+ * Must be called from within the same transaction that performs the state mutation.
  */
-export async function reserveIdempotencyKey(
-  tx: Transaction,
-  params: {
-    idempotencyKey: string;
-    action: string;
-    opportunityId: string;
-    businessId: string;
-    uid: string;
-  }
-): Promise<{ alreadyProcessed: boolean; priorResult?: unknown }> {
-  const ref = db.collection(ACTIONS_COLLECTION).doc(params.idempotencyKey);
-  const existing = await tx.get(ref);
-
-  if (existing.exists) {
-    const data = existing.data()!;
-    return { alreadyProcessed: true, priorResult: data.result };
-  }
-
-  tx.set(ref, {
-    idempotencyKey: params.idempotencyKey,
-    action: params.action,
-    opportunityId: params.opportunityId,
-    businessId: params.businessId,
-    uid: params.uid,
-    status: 'pending',
-    createdAt: Date.now(),
-  });
-
-  return { alreadyProcessed: false };
-}
-
-export async function finalizeIdempotencyKey(
-  idempotencyKey: string,
-  result: { status: 'succeeded' | 'failed'; result?: unknown; error?: string }
-): Promise<void> {
-  await db
-    .collection(ACTIONS_COLLECTION)
-    .doc(idempotencyKey)
-    .set(
-      {
-        status: result.status,
-        result: result.result ?? null,
-        error: result.error ?? null,
-        finalizedAt: Date.now(),
-      },
-      { merge: true }
-    );
-}
-
-/** Guards against a stuck "pending" key from a crashed invocation blocking retries forever. */
-export function isStalePending(createdAt: number, maxAgeMs = 60_000): boolean {
-  return Date.now() - createdAt > maxAgeMs;
+export async function claimIdempotencyKey(tx: Transaction, requestId: string): Promise<boolean> {
+  const ref = db.collection('actionRequests').doc(requestId);
+  const snap = await tx.get(ref);
+  if (snap.exists) return false; // already processed — caller should no-op successfully
+  tx.set(ref, { createdAt: Date.now() });
+  return true;
 }
 ```
 
-## 6. `functions/src/lib/antiSpam.ts`
-
-Implements sec. 55 (anti-spam checks) and sec. 56 (customer respect rule).
-
 ```typescript
-// functions/src/lib/antiSpam.ts
-import { OpportunityDoc } from '../types';
+// functions/src/lib/eligibility.ts
+import type { OpportunityDoc } from './types';
 
-export interface AntiSpamResult {
-  allowed: boolean;
+export interface EligibilityResult {
+  eligible: boolean;
   reason?: string;
 }
 
-const DEFAULT_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24h between automated follow-ups
-const DEFAULT_MAX_FOLLOW_UPS = 3;
-
-export function evaluateRecoveryEligibility(opp: OpportunityDoc): AntiSpamResult {
-  if (opp.customer_opted_out) {
-    return { allowed: false, reason: 'This customer asked not to be contacted again.' };
+/** Anti-spam / anti-harassment gate (spec §55–56). */
+export function checkRecoveryEligibility(o: OpportunityDoc, now: number): EligibilityResult {
+  if (o.explicitlyRejected) {
+    return { eligible: false, reason: 'No follow-up needed right now.' };
   }
-
-  if (opp.customer_rejected_at) {
-    return { allowed: false, reason: 'This customer already declined.' };
+  if (o.cooldownUntil && o.cooldownUntil > now) {
+    return { eligible: false, reason: 'No follow-up needed right now.' };
   }
-
-  if (opp.risk_state === 'CUSTOMER_RESPONDED' || opp.risk_state === 'PROGRESSING') {
-    return { allowed: false, reason: 'This customer already responded — no follow-up needed.' };
+  if (o.followUpCount >= o.maxFollowUps) {
+    return { eligible: false, reason: 'No follow-up needed right now.' };
   }
-
-  if (['BOOKED', 'WON', 'LOST', 'HANDLED'].includes(opp.risk_state)) {
-    return { allowed: false, reason: 'This opportunity is already resolved.' };
+  if (o.status === 'IGNORED' || o.status === 'NOT_A_CUSTOMER' || o.status === 'LOST') {
+    return { eligible: false, reason: 'This customer is no longer in recovery.' };
   }
-
-  const maxFollowUps = opp.max_follow_ups ?? DEFAULT_MAX_FOLLOW_UPS;
-  if ((opp.follow_up_count ?? 0) >= maxFollowUps) {
-    return { allowed: false, reason: "We've already followed up enough times." };
+  if (o.status === 'BOOKED' || o.status === 'WON' || o.status === 'HANDLED') {
+    return { eligible: false, reason: 'This customer has already been handled.' };
   }
-
-  if (opp.cooldown_until && Date.now() < opp.cooldown_until) {
-    return { allowed: false, reason: 'No follow-up needed right now.' };
+  if (o.status === 'RECOVERY_SENT' || o.status === 'WAITING') {
+    return { eligible: false, reason: 'A follow-up is already on its way.' };
   }
-
-  if (opp.presence?.handled_by_uid) {
-    return {
-      allowed: false,
-      reason: `${opp.presence.handled_by_name} is already handling this customer.`,
-    };
+  if (o.decisionBand === 'human_required') {
+    return { eligible: false, reason: 'This one needs your input first.' };
   }
-
-  return { allowed: true };
-}
-
-export function nextCooldownTimestamp(): number {
-  return Date.now() + DEFAULT_COOLDOWN_MS;
+  return { eligible: true };
 }
 ```
-
-## 7. `functions/src/lib/messaging.ts`
-
-Abstraction over the actual outbound send — deliberately isolated so the callables never talk to Twilio/WhatsApp/etc. directly, and so `recover()` can be unit-tested without network calls. Success here is only "message delivered", never "opportunity recovered" (sec. 22).
 
 ```typescript
 // functions/src/lib/messaging.ts
-import { ChannelType } from '../types';
+import type { OpportunityDoc, ChannelType } from './types';
 
-export interface SendResult {
-  delivered: boolean;
-  providerMessageId?: string;
-  error?: string;
-}
-
-interface SendParams {
-  businessId: string;
-  customerId: string;
+/**
+ * Integration point for the actual outbound-messaging provider (SMS/WhatsApp/email gateway).
+ * Kept as a template-based generator here; swap the body for a real provider call.
+ * Selecting template/channel/tone/timing is Isolynic's job, never the owner's (spec §17).
+ */
+export async function sendRecoveryMessage(o: OpportunityDoc): Promise<{
   channel: ChannelType;
-  message: string;
-}
+  messagePreview: string;
+}> {
+  const channel: ChannelType = o.sourceChannels[0] ?? 'sms';
+  const firstName = o.customerName.split(' ')[0];
 
-/**
- * Selects the best channel and dispatches the message. In production this
- * would call the appropriate provider (Twilio/WhatsApp Business API/email
- * provider) based on the customer's preferred/available channel.
- */
-export async function sendRecoveryMessage(params: SendParams): Promise<SendResult> {
-  try {
-    // Provider dispatch goes here. Kept abstract intentionally —
-    // swap in real provider SDKs per channel.
-    switch (params.channel) {
-      case 'whatsapp':
-      case 'sms':
-      case 'email':
-      case 'phone':
-      case 'website':
-      default:
-        // await providerFor(params.channel).send(...)
-        return { delivered: true, providerMessageId: `stub_${Date.now()}` };
-    }
-  } catch (err) {
-    return { delivered: false, error: err instanceof Error ? err.message : 'send_failed' };
-  }
-}
+  const messagePreview =
+    o.status === 'CUSTOMER_RESPONDED'
+      ? `Hi ${firstName}, great — let's get that scheduled.`
+      : `Hi ${firstName}, just checking whether you'd still like us to move forward. Happy to help whenever works for you.`;
 
-/**
- * Generates the outgoing message text for a given opportunity. In
- * production this calls the LLM/template engine; abstracted here so the
- * callable function has a single seam to mock in tests.
- */
-export async function composeRecoveryMessage(params: {
-  customerName: string;
-  intentSummary: string;
-  whyNow: string;
-}): Promise<string> {
-  const firstName = params.customerName.split(' ')[0];
-  return `Hi ${firstName}, just checking whether you'd still like us to help with that. Let us know what works for you.`;
+  // TODO: replace with real provider call (Twilio / WhatsApp Business API / SES, etc).
+  // await messagingProvider.send({ to: o.customerId, channel, body: messagePreview });
+
+  return { channel, messagePreview };
 }
 ```
 
-## 8. `functions/src/recoveryQueue/recover.ts`
-
-The most important action — sec. 17 (recover), sec. 22 (success ≠ message sent), sec. 34 (idempotent), sec. 39 (optional preview/edit), sec. 55 (anti-spam gate).
-
 ```typescript
-// functions/src/recoveryQueue/recover.ts
+// functions/src/recoverOpportunity.ts
 import { onCall, HttpsError } from 'firebase-functions/v2/https';
-import { db, FieldValue } from '../lib/admin';
-import { requireAuth, badRequest, notFound, failedPrecondition } from '../lib/errors';
-import { assertBusinessMember } from '../lib/authz';
-import { reserveIdempotencyKey, finalizeIdempotencyKey } from '../lib/idempotency';
-import { evaluateRecoveryEligibility, nextCooldownTimestamp } from '../lib/antiSpam';
-import { composeRecoveryMessage, sendRecoveryMessage } from '../lib/messaging';
-import { OpportunityDoc } from '../types';
+import { getFirestore } from 'firebase-admin/firestore';
+import { claimIdempotencyKey } from './lib/idempotency';
+import { checkRecoveryEligibility } from './lib/eligibility';
+import { sendRecoveryMessage } from './lib/messaging';
+import type { OpportunityDoc, EvidenceItem } from './lib/types';
 
-interface RecoverPayload {
-  businessId: string;
+const db = getFirestore();
+
+interface RecoverInput {
   opportunityId: string;
-  idempotencyKey: string;
-  editedMessage?: string;
+  requestId: string;
 }
 
-export const recover = onCall<RecoverPayload>(
-  { region: 'us-central1', cors: true },
-  async (request) => {
-    const uid = request.auth?.uid;
-    requireAuth(uid);
+export const recoverOpportunity = onCall<RecoverInput>({ cors: true }, async (request) => {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError('unauthenticated', 'Sign in required.');
 
-    const { businessId, opportunityId, idempotencyKey, editedMessage } = request.data ?? {};
-    if (!businessId || !opportunityId || !idempotencyKey) {
-      badRequest('businessId, opportunityId, and idempotencyKey are required.');
-    }
-
-    await assertBusinessMember(businessId, uid);
-
-    const oppRef = db
-      .collection('businesses')
-      .doc(businessId)
-      .collection('opportunities')
-      .doc(opportunityId);
-
-    // Step 1: reserve the idempotency key and read+validate opportunity
-    // state inside one transaction, so a duplicate call (retry, double
-    // webhook, double click) can never pass the eligibility check twice.
-    const reservation = await db.runTransaction(async (tx) => {
-      const oppSnap = await tx.get(oppRef);
-      if (!oppSnap.exists) notFound();
-
-      const opp = oppSnap.data() as OpportunityDoc;
-      if (opp.businessId !== businessId) notFound();
-
-      const idemp = await reserveIdempotencyKey(tx, {
-        idempotencyKey,
-        action: 'recover',
-        opportunityId,
-        businessId,
-        uid,
-      });
-
-      if (idemp.alreadyProcessed) {
-        return { skip: true as const, opp };
-      }
-
-      const eligibility = evaluateRecoveryEligibility(opp);
-      if (!eligibility.allowed) {
-        // Mark the reserved key failed so it doesn't dangle as "pending".
-        tx.set(
-          db.collection('recoveryActions').doc(idempotencyKey),
-          { status: 'failed', error: eligibility.reason, finalizedAt: Date.now() },
-          { merge: true }
-        );
-        return { skip: false as const, blocked: eligibility.reason, opp };
-      }
-
-      // Optimistically mark as owner-approved / sending so concurrent
-      // calls (e.g. two tabs) see this opportunity is already in flight.
-      tx.update(oppRef, {
-        risk_state: 'OWNER_APPROVED',
-        owner_action: 'recover',
-        updatedAt: Date.now(),
-      });
-
-      return { skip: false as const, opp };
-    });
-
-    if (reservation.skip) {
-      // Already handled by a prior identical call — return the same
-      // outcome without sending anything again.
-      return { ok: true, alreadyProcessed: true };
-    }
-
-    if (reservation.blocked) {
-      return { ok: false, reason: reservation.blocked };
-    }
-
-    const opp = reservation.opp;
-    const channel = opp.source_channels?.[0] ?? 'sms';
-
-    try {
-      const message =
-        editedMessage?.trim() ||
-        (await composeRecoveryMessage({
-          customerName: opp.customer_name,
-          intentSummary: opp.intent_summary,
-          whyNow: opp.why_now,
-        }));
-
-      const sendResult = await sendRecoveryMessage({
-        businessId,
-        customerId: opp.customer_id,
-        channel,
-        message,
-      });
-
-      if (!sendResult.delivered) {
-        await oppRef.update({
-          risk_state: 'RECOVERY_RECOMMENDED', // roll back to pre-send state
-          updatedAt: Date.now(),
-        });
-        await finalizeIdempotencyKey(idempotencyKey, {
-          status: 'failed',
-          error: sendResult.error ?? 'send_failed',
-        });
-        throw new HttpsError('unavailable', "We couldn't send that message.");
-      }
-
-      // Action success (sec 22) — NOT opportunity success. risk_state
-      // moves to RECOVERY_SENT/WAITING; only a later customer event
-      // advances it to CUSTOMER_RESPONDED/PROGRESSING/BOOKED etc.
-      const now = Date.now();
-      await oppRef.update({
-        risk_state: 'WAITING',
-        status: 'waiting',
-        last_recovery_action_id: idempotencyKey,
-        follow_up_count: FieldValue.increment(1),
-        cooldown_until: nextCooldownTimestamp(),
-        latest_activity_at: now,
-        updatedAt: now,
-        evidence: FieldValue.arrayUnion({
-          id: idempotencyKey,
-          event_type: 'recovery_message_sent',
-          timestamp: now,
-          channel,
-          summary: 'Follow-up sent.',
-          relevance: 1,
-        }),
-      });
-
-      await finalizeIdempotencyKey(idempotencyKey, {
-        status: 'succeeded',
-        result: { providerMessageId: sendResult.providerMessageId },
-      });
-
-      return { ok: true, alreadyProcessed: false };
-    } catch (err) {
-      await finalizeIdempotencyKey(idempotencyKey, {
-        status: 'failed',
-        error: err instanceof Error ? err.message : 'unknown_error',
-      });
-      if (err instanceof HttpsError) throw err;
-      throw new HttpsError('internal', "We couldn't send that message.");
-    }
+  const { opportunityId, requestId } = request.data;
+  if (!opportunityId || !requestId) {
+    throw new HttpsError('invalid-argument', 'opportunityId and requestId are required.');
   }
-);
-```
 
-## 9. `functions/src/recoveryQueue/handleMyself.ts`
+  const oppRef = db.collection('opportunities').doc(opportunityId);
 
-Sec. 18 — hands off to Conversation, sets lightweight presence (sec. 35).
+  const result = await db.runTransaction(async (tx) => {
+    const fresh = await claimIdempotencyKey(tx, requestId);
 
-```typescript
-// functions/src/recoveryQueue/handleMyself.ts
-import { onCall } from 'firebase-functions/v2/https';
-import { db } from '../lib/admin';
-import { requireAuth, badRequest, notFound } from '../lib/errors';
-import { assertBusinessMember } from '../lib/authz';
-import { reserveIdempotencyKey, finalizeIdempotencyKey } from '../lib/idempotency';
-import { CallablePayload } from '../types';
+    const snap = await tx.get(oppRef);
+    if (!snap.exists) throw new HttpsError('not-found', 'Opportunity not found.');
+    const o = snap.data() as OpportunityDoc;
 
-export const handleMyself = onCall<CallablePayload>(
-  { region: 'us-central1', cors: true },
-  async (request) => {
-    const uid = request.auth?.uid;
-    requireAuth(uid);
-
-    const { businessId, opportunityId, idempotencyKey } = request.data ?? {};
-    if (!businessId || !opportunityId || !idempotencyKey) {
-      badRequest('businessId, opportunityId, and idempotencyKey are required.');
+    // Ownership check — the caller must belong to the same business as the opportunity.
+    const userSnap = await tx.get(db.collection('users').doc(uid));
+    const userBusinessId = userSnap.data()?.businessId;
+    if (userBusinessId !== o.businessId) {
+      throw new HttpsError('permission-denied', 'Not authorized for this opportunity.');
     }
 
-    const member = await assertBusinessMember(businessId, uid);
+    if (!fresh) {
+      // Duplicate request already processed — return current state idempotently, no re-send.
+      return { ok: true, status: o.status, lastRecoveryAction: o.lastRecoveryAction ?? null };
+    }
 
-    const oppRef = db
-      .collection('businesses')
-      .doc(businessId)
-      .collection('opportunities')
-      .doc(opportunityId);
+    const now = Date.now();
+    const eligibility = checkRecoveryEligibility(o, now);
+    if (!eligibility.eligible) {
+      return { ok: false, reason: eligibility.reason };
+    }
+
+    return { pending: true, opportunity: o };
+  });
+
+  // Fresh, eligible recovery: perform the send outside the transaction, then commit atomically.
+  if ('pending' in result && result.pending) {
+    const o = result.opportunity;
+    const sent = await sendRecoveryMessage(o);
 
     await db.runTransaction(async (tx) => {
-      const oppSnap = await tx.get(oppRef);
-      if (!oppSnap.exists) notFound();
+      const snap = await tx.get(oppRef);
+      const current = snap.data() as OpportunityDoc;
 
-      const idemp = await reserveIdempotencyKey(tx, {
-        idempotencyKey,
-        action: 'handle_myself',
-        opportunityId,
-        businessId,
-        uid,
-      });
-      if (idemp.alreadyProcessed) return;
-
-      tx.update(oppRef, {
-        owner_action: 'handle_myself',
-        presence: {
-          handled_by_uid: uid,
-          handled_by_name: member.displayName,
-          handled_at: Date.now(),
-        },
-        // A person taking over always supersedes automation (sec 81).
-        risk_state: 'PROGRESSING',
-        status: 'responded',
-        updatedAt: Date.now(),
-      });
-    });
-
-    await finalizeIdempotencyKey(idempotencyKey, { status: 'succeeded' });
-
-    return { ok: true, conversationPath: `/conversations/${opportunityId}` };
-  }
-);
-```
-
-## 10. `functions/src/recoveryQueue/ignore.ts`
-
-Sec. 19 — with the snapshot needed for Undo (sec. 62).
-
-```typescript
-// functions/src/recoveryQueue/ignore.ts
-import { onCall } from 'firebase-functions/v2/https';
-import { db } from '../lib/admin';
-import { requireAuth, badRequest, notFound } from '../lib/errors';
-import { assertBusinessMember } from '../lib/authz';
-import { reserveIdempotencyKey, finalizeIdempotencyKey } from '../lib/idempotency';
-import { CallablePayload, OpportunityDoc } from '../types';
-
-export const ignore = onCall<CallablePayload>(
-  { region: 'us-central1', cors: true },
-  async (request) => {
-    const uid = request.auth?.uid;
-    requireAuth(uid);
-
-    const { businessId, opportunityId, idempotencyKey } = request.data ?? {};
-    if (!businessId || !opportunityId || !idempotencyKey) {
-      badRequest('businessId, opportunityId, and idempotencyKey are required.');
-    }
-
-    await assertBusinessMember(businessId, uid);
-
-    const oppRef = db
-      .collection('businesses')
-      .doc(businessId)
-      .collection('opportunities')
-      .doc(opportunityId);
-
-    await db.runTransaction(async (tx) => {
-      const oppSnap = await tx.get(oppRef);
-      if (!oppSnap.exists) notFound();
-      const opp = oppSnap.data() as OpportunityDoc;
-
-      const idemp = await reserveIdempotencyKey(tx, {
-        idempotencyKey,
-        action: 'ignore',
-        opportunityId,
-        businessId,
-        uid,
-      });
-      if (idemp.alreadyProcessed) return;
-
-      tx.update(oppRef, {
-        owner_action: 'ignore',
-        risk_state: 'HANDLED',
-        status: 'resolved',
-        // Kept as context/training signal for future prioritization (sec 19),
-        // never surfaced back to the UI directly.
-        pre_dismiss_snapshot: {
-          risk_state: opp.risk_state,
-          status: opp.status,
-          owner_action: opp.owner_action,
-        },
-        updatedAt: Date.now(),
-      });
-    });
-
-    await finalizeIdempotencyKey(idempotencyKey, { status: 'succeeded' });
-
-    return { ok: true };
-  }
-);
-```
-
-## 11. `functions/src/recoveryQueue/notACustomer.ts`
-
-Sec. 20 — distinct from Ignore; also feeds business-specific learning (sec. 76) via a lightweight signal write.
-
-```typescript
-// functions/src/recoveryQueue/notACustomer.ts
-import { onCall } from 'firebase-functions/v2/https';
-import { db, FieldValue } from '../lib/admin';
-import { requireAuth, badRequest, notFound } from '../lib/errors';
-import { assertBusinessMember } from '../lib/authz';
-import { reserveIdempotencyKey, finalizeIdempotencyKey } from '../lib/idempotency';
-import { CallablePayload, OpportunityDoc } from '../types';
-
-export const notACustomer = onCall<CallablePayload>(
-  { region: 'us-central1', cors: true },
-  async (request) => {
-    const uid = request.auth?.uid;
-    requireAuth(uid);
-
-    const { businessId, opportunityId, idempotencyKey } = request.data ?? {};
-    if (!businessId || !opportunityId || !idempotencyKey) {
-      badRequest('businessId, opportunityId, and idempotencyKey are required.');
-    }
-
-    await assertBusinessMember(businessId, uid);
-
-    const oppRef = db
-      .collection('businesses')
-      .doc(businessId)
-      .collection('opportunities')
-      .doc(opportunityId);
-
-    let category: string | undefined;
-
-    await db.runTransaction(async (tx) => {
-      const oppSnap = await tx.get(oppRef);
-      if (!oppSnap.exists) notFound();
-      const opp = oppSnap.data() as OpportunityDoc;
-      category = classifyForLearning(opp);
-
-      const idemp = await reserveIdempotencyKey(tx, {
-        idempotencyKey,
-        action: 'not_a_customer',
-        opportunityId,
-        businessId,
-        uid,
-      });
-      if (idemp.alreadyProcessed) return;
-
-      tx.update(oppRef, {
-        owner_action: 'not_a_customer',
-        risk_state: 'HANDLED',
-        status: 'resolved',
-        pre_dismiss_snapshot: {
-          risk_state: opp.risk_state,
-          status: opp.status,
-          owner_action: opp.owner_action,
-        },
-        updatedAt: Date.now(),
-      });
-
-      // Aggregate learning signal — never exposed in the UI, just used to
-      // dampen future alerts for similar interaction shapes (sec 76).
-      if (category) {
-        const signalRef = db
-          .collection('businesses')
-          .doc(businessId)
-          .collection('learningSignals')
-          .doc(category);
-        tx.set(
-          signalRef,
-          { not_a_customer_count: FieldValue.increment(1), updatedAt: Date.now() },
-          { merge: true }
-        );
+      // Compare-and-swap guard: if state changed between read and write (e.g. customer
+      // replied in the meantime, or another concurrent call won the race), don't overwrite it.
+      if (current.status !== o.status || current.version !== o.version) {
+        return;
       }
+
+      const evidenceEntry: EvidenceItem = {
+        id: db.collection('_').doc().id,
+        eventType: 'recovery_sent',
+        timestamp: Date.now(),
+        channel: sent.channel,
+        summary: sent.messagePreview,
+        relevance: 'primary',
+      };
+
+      tx.update(oppRef, {
+        status: 'RECOVERY_SENT',
+        ownerAction: 'recover',
+        lastRecoveryAction: {
+          type: 'follow_up',
+          at: Date.now(),
+          channel: sent.channel,
+          messagePreview: sent.messagePreview,
+        },
+        followUpCount: current.followUpCount + 1,
+        cooldownUntil: Date.now() + 24 * 60 * 60 * 1000,
+        evidence: [...current.evidence, evidenceEntry],
+        version: current.version + 1,
+        updatedAt: Date.now(),
+      });
+
+      tx.set(
+        db.collection('auditLog').doc(),
+        {
+          opportunityId,
+          businessId: current.businessId,
+          actorUid: uid,
+          action: 'recover',
+          at: Date.now(),
+        }
+      );
     });
 
-    await finalizeIdempotencyKey(idempotencyKey, { status: 'succeeded' });
-
-    return { ok: true };
+    return {
+      ok: true,
+      status: 'RECOVERY_SENT',
+      lastRecoveryAction: { type: 'follow_up', at: Date.now(), channel: sent.channel, messagePreview: sent.messagePreview },
+    };
   }
-);
 
-function classifyForLearning(opp: OpportunityDoc): string | undefined {
-  // Simplistic bucket by first evidence event_type + channel; a real
-  // implementation would use the same feature set as the scoring model.
-  const firstEvidence = opp.evidence?.[0];
-  if (!firstEvidence) return undefined;
-  return `${firstEvidence.channel}:${firstEvidence.event_type}`;
-}
+  return result as { ok: boolean; reason?: string; status?: string };
+});
 ```
 
-## 12. `functions/src/recoveryQueue/undo.ts`
-
-Sec. 62 — restores the pre-dismiss snapshot within a short window.
-
 ```typescript
-// functions/src/recoveryQueue/undo.ts
-import { onCall } from 'firebase-functions/v2/https';
-import { db } from '../lib/admin';
-import { requireAuth, badRequest, notFound, failedPrecondition } from '../lib/errors';
-import { assertBusinessMember } from '../lib/authz';
-import { reserveIdempotencyKey, finalizeIdempotencyKey } from '../lib/idempotency';
-import { CallablePayload, OpportunityDoc } from '../types';
+// functions/src/ignoreOpportunity.ts
+import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import { getFirestore } from 'firebase-admin/firestore';
+import { claimIdempotencyKey } from './lib/idempotency';
+import type { OpportunityDoc } from './lib/types';
 
+const db = getFirestore();
 const UNDO_WINDOW_MS = 10_000;
 
-interface UndoPayload extends CallablePayload {
-  priorAction: 'ignore' | 'not_a_customer';
-}
-
-export const undo = onCall<UndoPayload>(
-  { region: 'us-central1', cors: true },
+export const ignoreOpportunity = onCall<{ opportunityId: string; requestId: string }>(
+  { cors: true },
   async (request) => {
     const uid = request.auth?.uid;
-    requireAuth(uid);
+    if (!uid) throw new HttpsError('unauthenticated', 'Sign in required.');
+    const { opportunityId, requestId } = request.data;
 
-    const { businessId, opportunityId, idempotencyKey, priorAction } = request.data ?? {};
-    if (!businessId || !opportunityId || !idempotencyKey || !priorAction) {
-      badRequest('businessId, opportunityId, idempotencyKey, and priorAction are required.');
-    }
+    const oppRef = db.collection('opportunities').doc(opportunityId);
 
-    await assertBusinessMember(businessId, uid);
+    return db.runTransaction(async (tx) => {
+      const fresh = await claimIdempotencyKey(tx, requestId);
+      const snap = await tx.get(oppRef);
+      if (!snap.exists) throw new HttpsError('not-found', 'Opportunity not found.');
+      const o = snap.data() as OpportunityDoc;
 
-    const oppRef = db
-      .collection('businesses')
-      .doc(businessId)
-      .collection('opportunities')
-      .doc(opportunityId);
-
-    await db.runTransaction(async (tx) => {
-      const oppSnap = await tx.get(oppRef);
-      if (!oppSnap.exists) notFound();
-      const opp = oppSnap.data() as OpportunityDoc;
-
-      const idemp = await reserveIdempotencyKey(tx, {
-        idempotencyKey,
-        action: 'undo',
-        opportunityId,
-        businessId,
-        uid,
-      });
-      if (idemp.alreadyProcessed) return;
-
-      if (opp.owner_action !== priorAction) {
-        failedPrecondition('This action can no longer be undone.');
+      const userSnap = await tx.get(db.collection('users').doc(uid));
+      if (userSnap.data()?.businessId !== o.businessId) {
+        throw new HttpsError('permission-denied', 'Not authorized for this opportunity.');
       }
-      if (Date.now() - opp.updatedAt > UNDO_WINDOW_MS) {
-        failedPrecondition('The window to undo this action has passed.');
-      }
-      if (!opp.pre_dismiss_snapshot) {
-        failedPrecondition('Nothing to undo.');
-      }
+
+      if (!fresh) return { ok: true };
 
       tx.update(oppRef, {
-        ...opp.pre_dismiss_snapshot,
-        pre_dismiss_snapshot: null,
+        status: 'IGNORED',
+        ownerAction: 'ignore',
+        priorSnapshot: { status: o.status, ownerAction: o.ownerAction ?? null },
+        undoExpiresAt: Date.now() + UNDO_WINDOW_MS,
+        version: o.version + 1,
         updatedAt: Date.now(),
       });
+
+      return { ok: true };
     });
-
-    await finalizeIdempotencyKey(idempotencyKey, { status: 'succeeded' });
-
-    return { ok: true };
   }
 );
 ```
 
-## 13. `functions/src/index.ts`
+```typescript
+// functions/src/markNotACustomer.ts
+import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import { getFirestore, FieldValue } from 'firebase-admin/firestore';
+import { claimIdempotencyKey } from './lib/idempotency';
+import type { OpportunityDoc } from './lib/types';
+
+const db = getFirestore();
+const UNDO_WINDOW_MS = 10_000;
+
+export const markNotACustomer = onCall<{ opportunityId: string; requestId: string }>(
+  { cors: true },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) throw new HttpsError('unauthenticated', 'Sign in required.');
+    const { opportunityId, requestId } = request.data;
+
+    const oppRef = db.collection('opportunities').doc(opportunityId);
+
+    return db.runTransaction(async (tx) => {
+      const fresh = await claimIdempotencyKey(tx, requestId);
+      const snap = await tx.get(oppRef);
+      if (!snap.exists) throw new HttpsError('not-found', 'Opportunity not found.');
+      const o = snap.data() as OpportunityDoc;
+
+      const userSnap = await tx.get(db.collection('users').doc(uid));
+      if (userSnap.data()?.businessId !== o.businessId) {
+        throw new HttpsError('permission-denied', 'Not authorized for this opportunity.');
+      }
+
+      if (!fresh) return { ok: true };
+
+      tx.update(oppRef, {
+        status: 'NOT_A_CUSTOMER',
+        ownerAction: 'not_a_customer',
+        priorSnapshot: { status: o.status, ownerAction: o.ownerAction ?? null },
+        undoExpiresAt: Date.now() + UNDO_WINDOW_MS,
+        version: o.version + 1,
+        updatedAt: Date.now(),
+      });
+
+      // Feed the business-level learning signal (spec §76) — reduces future false positives
+      // for similar interaction categories without changing the UI.
+      const learningRef = db.collection('businesses').doc(o.businessId).collection('learning').doc('notACustomerCategories');
+      tx.set(
+        learningRef,
+        {
+          [`counts.${o.intentSummary.slice(0, 40)}`]: FieldValue.increment(1),
+          updatedAt: Date.now(),
+        },
+        { merge: true }
+      );
+
+      return { ok: true };
+    });
+  }
+);
+```
+
+```typescript
+// functions/src/undoAction.ts
+import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import { getFirestore } from 'firebase-admin/firestore';
+import type { OpportunityDoc } from './lib/types';
+
+const db = getFirestore();
+
+export const undoAction = onCall<{ opportunityId: string }>({ cors: true }, async (request) => {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError('unauthenticated', 'Sign in required.');
+  const { opportunityId } = request.data;
+
+  const oppRef = db.collection('opportunities').doc(opportunityId);
+
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(oppRef);
+    if (!snap.exists) throw new HttpsError('not-found', 'Opportunity not found.');
+    const o = snap.data() as OpportunityDoc;
+
+    const userSnap = await tx.get(db.collection('users').doc(uid));
+    if (userSnap.data()?.businessId !== o.businessId) {
+      throw new HttpsError('permission-denied', 'Not authorized for this opportunity.');
+    }
+
+    if (!o.undoExpiresAt || o.undoExpiresAt < Date.now() || !o.priorSnapshot) {
+      return { ok: false, reason: 'This can no longer be undone.' };
+    }
+
+    tx.update(oppRef, {
+      status: o.priorSnapshot.status,
+      ownerAction: o.priorSnapshot.ownerAction ?? null,
+      priorSnapshot: null,
+      undoExpiresAt: null,
+      version: o.version + 1,
+      updatedAt: Date.now(),
+    });
+
+    return { ok: true };
+  });
+});
+```
+
+```typescript
+// functions/src/claimHandling.ts
+import { onCall, HttpsError } from 'firebase-functions/v2/https';
+import { getFirestore } from 'firebase-admin/firestore';
+import type { OpportunityDoc } from './lib/types';
+
+const db = getFirestore();
+
+/** Lightweight presence/ownership so "Handle myself" doesn't collide across staff (spec §35). */
+export const claimHandling = onCall<{ opportunityId: string }>({ cors: true }, async (request) => {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError('unauthenticated', 'Sign in required.');
+  const { opportunityId } = request.data;
+
+  const oppRef = db.collection('opportunities').doc(opportunityId);
+  const userSnap = await db.collection('users').doc(uid).get();
+  const businessId = userSnap.data()?.businessId;
+  const displayName = userSnap.data()?.displayName ?? 'A teammate';
+
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(oppRef);
+    if (!snap.exists) throw new HttpsError('not-found', 'Opportunity not found.');
+    const o = snap.data() as OpportunityDoc;
+
+    if (o.businessId !== businessId) {
+      throw new HttpsError('permission-denied', 'Not authorized for this opportunity.');
+    }
+
+    if (o.handledByUid && o.handledByUid !== uid) {
+      return { ok: false, reason: `${o.handledByName ?? 'Someone else'} is already handling this.` };
+    }
+
+    tx.update(oppRef, {
+      handledByUid: uid,
+      handledByName: displayName,
+      ownerAction: 'handle_myself',
+      version: o.version + 1,
+      updatedAt: Date.now(),
+    });
+
+    return { ok: true };
+  });
+});
+```
+
+```typescript
+// functions/src/onOpportunityWrite.ts
+import { onDocumentWritten } from 'firebase-functions/v2/firestore';
+import { getFirestore } from 'firebase-admin/firestore';
+import { computePriorityScore, scoreToPriorityBand, scoreToDecisionBand } from './lib/priority';
+import type { OpportunityDoc } from './lib/types';
+
+const db = getFirestore();
+
+/**
+ * Keeps priorityScore / priorityBand / decisionBand in sync whenever an opportunity's
+ * underlying signals change, so the client never computes prioritization itself (spec §11/§42).
+ * Also enforces basic deduplication safety: if two opportunity docs end up representing the
+ * same customer + business with high-confidence identity match, the newer one is merged
+ * into the older and marked HANDLED rather than left to duplicate in the queue (spec §36).
+ */
+export const onOpportunityWrite = onDocumentWritten('opportunities/{opportunityId}', async (event) => {
+  const after = event.data?.after;
+  if (!after || !after.exists) return; // deleted — nothing to do
+
+  const o = after.data() as OpportunityDoc;
+  const before = event.data?.before?.exists ? (event.data.before.data() as OpportunityDoc) : null;
+
+  // Avoid infinite loops: skip if only fields this function itself writes have changed.
+  if (
+    before &&
+    before.intentSummary === o.intentSummary &&
+    before.valueEstimate === o.valueEstimate &&
+    before.riskState === o.riskState &&
+    before.status === o.status
+  ) {
+    return;
+  }
+
+  const businessSnap = await db.collection('businesses').doc(o.businessId).get();
+  const avgTransactionValue = (businessSnap.data()?.avgTransactionValue as number) ?? null;
+
+  const intentConfidence = o.evidence.some((e) => e.relevance === 'primary') ? 0.8 : 0.5;
+  const deteriorationRisk = o.riskState === 'critical' ? 1 : o.riskState === 'deteriorating' ? 0.7 : 0.3;
+  const recoveryEffectiveness = o.followUpCount === 0 ? 0.8 : Math.max(0.2, 0.8 - o.followUpCount * 0.2);
+
+  const priorityScore = computePriorityScore({
+    intentConfidence,
+    valueEstimate: o.valueEstimate ?? null,
+    avgTransactionValue,
+    deteriorationRisk,
+    recoveryEffectiveness,
+  });
+
+  const priorityBand = scoreToPriorityBand(priorityScore);
+  const hasRequiredPricingInfo = businessSnap.data()?.hasPricingConfigured !== false;
+  const decisionBand = scoreToDecisionBand({
+    score: priorityScore,
+    hasRequiredPricingInfo,
+    isAmbiguousIntent: intentConfidence < 0.55,
+  });
+
+  const needsOwnerReason =
+    decisionBand === 'human_required'
+      ? !hasRequiredPricingInfo
+        ? `${o.customerName.split(' ')[0]} wants a price for a service you haven't given Isolynic pricing for.`
+        : `This customer may be important, but Isolynic needs your input before continuing.`
+      : null;
+
+  const changed =
+    o.priorityScore !== priorityScore ||
+    o.priorityBand !== priorityBand ||
+    o.decisionBand !== decisionBand ||
+    o.needsOwnerReason !== needsOwnerReason;
+
+  if (changed) {
+    await after.ref.update({
+      priorityScore,
+      priorityBand,
+      decisionBand,
+      needsOwnerReason,
+      updatedAt: Date.now(),
+    });
+  }
+
+  // Deduplication safety net (spec §36): same customer + business, both still active.
+  if (o.status !== 'HANDLED' && o.status !== 'IGNORED' && o.status !== 'NOT_A_CUSTOMER') {
+    const dupSnap = await db
+      .collection('opportunities')
+      .where('businessId', '==', o.businessId)
+      .where('customerId', '==', o.customerId)
+      .where('status', 'in', ['NEW_RISK', 'RECOVERY_RECOMMENDED', 'OWNER_APPROVED', 'RECOVERY_SENT', 'WAITING'])
+      .get();
+
+    if (dupSnap.size > 1) {
+      const sorted = dupSnap.docs.sort(
+        (a, b) => (a.data().createdAt as number) - (b.data().createdAt as number)
+      );
+      const canonical = sorted[0];
+      const duplicates = sorted.slice(1);
+
+      await db.runTransaction(async (tx) => {
+        const canonicalSnap = await tx.get(canonical.ref);
+        const canonicalData = canonicalSnap.data() as OpportunityDoc;
+        let mergedEvidence = canonicalData.evidence;
+
+        for (const dup of duplicates) {
+          const dupData = dup.data() as OpportunityDoc;
+          mergedEvidence = [...mergedEvidence, ...dupData.evidence];
+          tx.update(dup.ref, {
+            status: 'HANDLED',
+            outcomeNote: 'Merged into a single opportunity for this customer.',
+            version: (dupData.version ?? 0) + 1,
+            updatedAt: Date.now(),
+          });
+        }
+
+        tx.update(canonical.ref, {
+          evidence: mergedEvidence,
+          sourceChannels: Array.from(new Set(mergedEvidence.map((e) => e.channel))),
+          version: (canonicalData.version ?? 0) + 1,
+          updatedAt: Date.now(),
+        });
+      });
+    }
+  }
+});
+```
 
 ```typescript
 // functions/src/index.ts
-export { recover } from './recoveryQueue/recover';
-export { handleMyself as handle_myself } from './recoveryQueue/handleMyself';
-export { ignore } from './recoveryQueue/ignore';
-export { notACustomer as not_a_customer } from './recoveryQueue/notACustomer';
-export { undo } from './recoveryQueue/undo';
+export { recoverOpportunity } from './recoverOpportunity';
+export { ignoreOpportunity } from './ignoreOpportunity';
+export { markNotACustomer } from './markNotACustomer';
+export { undoAction } from './undoAction';
+export { claimHandling } from './claimHandling';
+export { onOpportunityWrite } from './onOpportunityWrite';
 ```
 
-Note the export names — the client calls `httpsCallable(functions, 'recoveryQueue-<action>')`, so if you're using Firebase's function-group naming, wrap these with `onCall` inside a `functions.https.onCall` group, or simplest: deploy each as its own top-level function and update the client hook to call `recoveryQueue_recover`, `recoveryQueue_handle_myself`, etc. — Firestore-based Cloud Functions v2 doesn't nest names by default, so rename the exports to match whatever convention you deploy with (e.g. `export const recoveryQueueRecover = recover;`).
+## Firestore Security Rules (supporting excerpt)
+
+```
+// firestore.rules (opportunities collection excerpt)
+match /opportunities/{opportunityId} {
+  allow read: if request.auth != null
+    && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.businessId == resource.data.businessId;
+  // All writes go through Cloud Functions (server-side ownership + idempotency + CAS checks).
+  allow write: if false;
+}
+
+match /actionRequests/{requestId} {
+  allow read, write: if false; // internal idempotency ledger only
+}
+```
 
 ---
 
-Want me to write the companion **Firestore security rules** (locking down direct writes to `opportunities` so all state changes must go through these callables) and the **`onDocumentWritten` trigger** that recalculates `priority_score`/`needs_owner` and detects customer replies to advance `risk_state` automatically?
+### Notes on the implementation
+
+- **Duplicate/idempotent recovery (§34)** is enforced two ways: a client-generated `requestId` claimed exactly once in `actionRequests`, plus a compare-and-swap on `status`/`version` inside the transaction that actually sends the message.
+- **Priority, decision bands, and "why" text** are computed server-side (`onOpportunityWrite`) so the client never invents certainty language — it only renders what Firestore already decided (§77).
+- **Anti-spam gating** (`checkRecoveryEligibility`) blocks sends on cooldown, max-follow-up, or explicit rejection, surfaced to the owner as the plain-language "No follow-up needed right now" (§55).
+- **Undo** stores a `priorSnapshot` with a 10-second `undoExpiresAt` window rather than hard-deleting state, matching the "Marked as not a customer. Undo" pattern (§62).
+- Swap `sendRecoveryMessage`'s stub body for your real messaging provider (Twilio/WhatsApp Business API/etc.) when ready — the transaction boundaries around it already guarantee at-most-once delivery per opportunity state.

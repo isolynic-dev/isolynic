@@ -212,7 +212,7 @@ const firebaseConfig: FirebaseOptions = {
 export const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 export const db = getFirestore(app);
 export const functions = getFunctions(app, 'us-central1');
-export const auth = getAuth(app);
+
 
 if (process.env.NEXT_PUBLIC_USE_FIREBASE_EMULATORS === 'true') {
   // Guard against re-connecting on hot reload

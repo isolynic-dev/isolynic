@@ -1,14 +1,30 @@
 "use client";
-// src/lib/analytics.ts
 
+import {
+  getFirebaseAnalytics,
+} from "./firebase";
 
-import { logEvent } from "firebase/analytics";
-import { getFirebaseAnalytics } from "./firebase";
+import {
+  logEvent,
+  type Analytics,
+} from "firebase/analytics";
 
-/**
- * Internal event names — never surfaced to the user.
- * Kept as a union so callers can't typo an event name.
- */
+// ---------------------------------------------------------------------------
+// Shared analytics payload
+// ---------------------------------------------------------------------------
+
+export interface AnalyticsPayload {
+  [key: string]:
+    | string
+    | number
+    | boolean
+    | undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Welcome analytics events
+// ---------------------------------------------------------------------------
+
 export type WelcomeEvent =
   | "welcome_viewed"
   | "see_how_it_works_clicked"
@@ -24,25 +40,10 @@ export type WelcomeEvent =
   | "first_test_started"
   | "first_test_completed";
 
-export async function track(
-  event: WelcomeEvent,
-  params?: Record<string, string | number | boolean>
-): Promise<void> {
-  try {
-    const analytics = await getFirebaseAnalytics();
-    if (!analytics) return;
-    logEvent(analytics, event, params);
-  } catch {
-    // Analytics failures must never affect the user experience.
-  }
-}
+// ---------------------------------------------------------------------------
+// Home analytics events
+// ---------------------------------------------------------------------------
 
-
-
-
-
-
-// Event names as specified in §57 "Core Analytics for Home".
 export type HomeAnalyticsEvent =
   | "home_viewed"
   | "attention_card_viewed"
@@ -55,26 +56,134 @@ export type HomeAnalyticsEvent =
   | "home_error"
   | "customer_action_completed";
 
-interface AnalyticsPayload {
-  [key: string]: string | number | boolean | undefined;
+// ---------------------------------------------------------------------------
+// All application analytics events
+// ---------------------------------------------------------------------------
+
+export type AnalyticsEvent =
+  | WelcomeEvent
+  | HomeAnalyticsEvent;
+
+// ---------------------------------------------------------------------------
+// Firebase Analytics instance helper
+// ---------------------------------------------------------------------------
+
+let cachedAnalytics: Analytics | null = null;
+
+async function getAnalyticsInstance(): Promise<Analytics | null> {
+  if (cachedAnalytics) {
+    return cachedAnalytics;
+  }
+
+  const analytics = await getFirebaseAnalytics();
+
+  if (!analytics) {
+    return null;
+  }
+
+  cachedAnalytics = analytics;
+
+  return analytics;
 }
 
-/**
- * Thin analytics facade. Swap the internals for Segment / Amplitude / GA4 /
- * a Firebase Analytics logEvent call without touching call sites.
- */
-export function track(event: HomeAnalyticsEvent, payload: AnalyticsPayload = {}): void {
-  if (typeof window === "undefined") return;
+// ---------------------------------------------------------------------------
+// Browser event helper
+// ---------------------------------------------------------------------------
+
+function emitLocalAnalyticsEvent(
+  event: AnalyticsEvent,
+  payload: AnalyticsPayload
+): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+
   try {
-    // Example real wiring:
-    // import { getAnalytics, logEvent } from "firebase/analytics";
-    // logEvent(getAnalytics(app), event, payload);
+    window.dispatchEvent(
+      new CustomEvent("isolynic:analytics", {
+        detail: {
+          event,
+          payload,
+        },
+      })
+    );
+  } catch {
+    // Local analytics events must never break the product.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main analytics tracker
+// ---------------------------------------------------------------------------
+
+export async function track(
+  event: AnalyticsEvent,
+  payload: AnalyticsPayload = {}
+): Promise<void> {
+  try {
+    const analytics = await getAnalyticsInstance();
+
+    if (analytics) {
+      logEvent(
+        analytics,
+        event,
+        payload
+      );
+    }
+
+    emitLocalAnalyticsEvent(
+      event,
+      payload
+    );
+
     if (process.env.NODE_ENV !== "production") {
       // eslint-disable-next-line no-console
-      console.debug(`[analytics] ${event}`, payload);
+      console.debug(
+        `[analytics] ${event}`,
+        payload
+      );
     }
-    window.dispatchEvent(new CustomEvent("isolynic:analytics", { detail: { event, payload } }));
   } catch {
-    // Analytics must never break the product experience.
+    // Analytics failures must never affect the user experience.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Backwards-compatible generic analytics helper
+// ---------------------------------------------------------------------------
+
+export async function logAnalyticsEvent(
+  name: string,
+  params?: Record<string, unknown>
+): Promise<void> {
+  try {
+    const analytics = await getAnalyticsInstance();
+
+    if (!analytics) {
+      return;
+    }
+
+    const safeParams: AnalyticsPayload = {};
+
+    if (params) {
+      for (const [key, value] of Object.entries(params)) {
+        if (
+          typeof value === "string" ||
+          typeof value === "number" ||
+          typeof value === "boolean" ||
+          value === undefined
+        ) {
+          safeParams[key] = value;
+        }
+      }
+    }
+
+    logEvent(
+      analytics,
+      name,
+      safeParams
+    );
+  } catch {
+    // Analytics failures must never break the UI.
   }
 }

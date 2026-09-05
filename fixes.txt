@@ -1,0 +1,109 @@
+The three errors have the **same root cause**: this file is importing `OpportunityDoc` from `@/types/customer`, but the `OpportunityDoc` definition you provided is actually in `@/types/recovery`. That recovery definition explicitly contains `priorityBand`, `decisionBand`, and `status`.
+
+So you do **not** need to change the queue logic. You only need to correct the import location.
+
+### 1. Find this exact import block
+
+```typescript
+import type {
+  CustomerDoc,
+  OpportunityDoc,
+  ConversationDoc,
+  MessagePreviewDoc,
+  TimelineEventDoc,
+  AppointmentDoc,
+  CustomerNoteDoc,
+  SmartSuggestionDoc,
+} from "@/types/customer";
+```
+
+### Replace it with
+
+```typescript
+import type {
+  CustomerDoc,
+  ConversationDoc,
+  MessagePreviewDoc,
+  TimelineEventDoc,
+  AppointmentDoc,
+  CustomerNoteDoc,
+  SmartSuggestionDoc,
+} from "@/types/customer";
+```
+
+### 2. Find your existing recovery import
+
+Currently you have:
+
+```typescript
+import {
+  ACTIVE_QUEUE_STATUSES,
+  RECENTLY_RESOLVED_STATUSES,
+} from "@/types/recovery";
+```
+
+### Replace it with
+
+```typescript
+import {
+  ACTIVE_QUEUE_STATUSES,
+  RECENTLY_RESOLVED_STATUSES,
+  type OpportunityDoc,
+} from "@/types/recovery";
+```
+
+That's the precise fix.
+
+Your resulting import area should therefore contain these two sections:
+
+```typescript
+import type {
+  CustomerDoc,
+  ConversationDoc,
+  MessagePreviewDoc,
+  TimelineEventDoc,
+  AppointmentDoc,
+  CustomerNoteDoc,
+  SmartSuggestionDoc,
+} from "@/types/customer";
+
+import {
+  ACTIVE_QUEUE_STATUSES,
+  RECENTLY_RESOLVED_STATUSES,
+  type OpportunityDoc,
+} from "@/types/recovery";
+```
+
+### Why this fixes all three errors
+
+Your `OpportunityDoc` in `types/recovery` contains:
+
+```typescript
+status: OpportunityLifecycleStatus;
+priorityBand: PriorityBand;
+decisionBand: DecisionBand;
+```
+
+So these lines in your hook become valid:
+
+```typescript
+if (doc.priorityBand === "high")
+```
+
+```typescript
+o.decisionBand === "human_required"
+```
+
+```typescript
+o.status === "CUSTOMER_RESPONDED"
+```
+
+and:
+
+```typescript
+o.status === "HANDLED"
+o.status === "BOOKED"
+o.status === "WON"
+```
+
+The important thing is **not to add those properties manually to another `OpportunityDoc` type**. You already have the correct definition in `types/recovery`; the hook was simply importing the wrong type. 

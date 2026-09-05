@@ -1,25 +1,54 @@
 "use client";
-// src/lib/firebase.ts
 
+import {
+  initializeApp,
+  getApps,
+  getApp,
+  type FirebaseApp,
+  type FirebaseOptions,
+} from "firebase/app";
 
-import { initializeApp, getApps, getApp, type FirebaseApp } from "firebase/app";
 import {
   getAuth,
+  connectAuthEmulator,
   GoogleAuthProvider,
   type Auth,
 } from "firebase/auth";
-import { getFirestore, type Firestore } from "firebase/firestore";
-import { getAnalytics, isSupported, type Analytics } from "firebase/analytics";
+
 import {
+  initializeFirestore,
   getFirestore,
-  enableIndexedDbPersistence,
+  connectFirestoreEmulator,
+  persistentLocalCache,
+  persistentMultipleTabManager,
   type Firestore,
 } from "firebase/firestore";
-import { getAuth, type Auth } from "firebase/auth";
 
+import {
+  getFunctions,
+  connectFunctionsEmulator,
+  type Functions,
+} from "firebase/functions";
 
+import {
+  getStorage,
+  type FirebaseStorage,
+} from "firebase/storage";
 
-const firebaseConfig = {
+import {
+  getAnalytics,
+  isSupported,
+  type Analytics,
+} from "firebase/analytics";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+const FUNCTIONS_REGION = "us-central1";
+const EMULATOR_HOST = "localhost";
+
+const firebaseConfig: FirebaseOptions = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
   authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
   projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
@@ -29,84 +58,160 @@ const firebaseConfig = {
   measurementId: process.env.NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID,
 };
 
-function requireEnv() {
+const isBrowser = typeof window !== "undefined";
+const useEmulators =
+  process.env.NEXT_PUBLIC_USE_FIREBASE_EMULATORS === "true";
+
+// ---------------------------------------------------------------------------
+// Environment validation
+// ---------------------------------------------------------------------------
+
+function validateEnv(): void {
+  if (!isBrowser) return;
+
   const missing = Object.entries(firebaseConfig)
     .filter(([key, value]) => key !== "measurementId" && !value)
     .map(([key]) => key);
 
-  if (missing.length > 0 && typeof window !== "undefined") {
-    // Fail loudly in dev, quietly degrade in prod (screen must still render).
-    // eslint-disable-next-line no-console
-    console.error(
-      `[Isolynic] Missing Firebase env vars: ${missing.join(", ")}`
-    );
+  if (missing.length === 0) return;
+
+  // eslint-disable-next-line no-console
+  console.error(
+    `[Isolynic] Missing Firebase environment variables: ${missing.join(", ")}`
+  );
+}
+
+validateEnv();
+
+// ---------------------------------------------------------------------------
+// Firebase App
+// ---------------------------------------------------------------------------
+
+export const firebaseApp: FirebaseApp =
+  getApps().length > 0
+    ? getApp()
+    : initializeApp(firebaseConfig);
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+export const auth: Auth = getAuth(firebaseApp);
+
+export const googleProvider = new GoogleAuthProvider();
+
+// ---------------------------------------------------------------------------
+// Cloud Functions
+// ---------------------------------------------------------------------------
+
+export const functions: Functions = getFunctions(
+  firebaseApp,
+  FUNCTIONS_REGION
+);
+
+// ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
+
+export const storage: FirebaseStorage = getStorage(firebaseApp);
+
+// ---------------------------------------------------------------------------
+// Firestore
+// ---------------------------------------------------------------------------
+
+function createFirestore(): Firestore {
+  // SSR / non-browser environments cannot use IndexedDB persistence.
+  if (!isBrowser) {
+    return getFirestore(firebaseApp);
+  }
+
+  try {
+    return initializeFirestore(firebaseApp, {
+      localCache: persistentLocalCache({
+        tabManager: persistentMultipleTabManager(),
+      }),
+    });
+  } catch {
+    // Firestore has already been initialized elsewhere, such as
+    // during Next.js hot reload or another module import.
+    return getFirestore(firebaseApp);
   }
 }
 
-requireEnv();
+export const db: Firestore = createFirestore();
 
-export const firebaseApp: FirebaseApp =
-  getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-
-export const auth: Auth = getAuth(firebaseApp);
-export const db: Firestore = getFirestore(firebaseApp);
-export const googleProvider = new GoogleAuthProvider();
+// ---------------------------------------------------------------------------
+// Firebase Analytics
+// ---------------------------------------------------------------------------
 
 let analyticsInstance: Analytics | null = null;
 
-/**
- * Analytics must never block or crash the Welcome screen.
- * Lazily and safely initialized, browser-only.
- */
 export async function getFirebaseAnalytics(): Promise<Analytics | null> {
-  if (typeof window === "undefined") return null;
-  if (analyticsInstance) return analyticsInstance;
+  if (!isBrowser) return null;
+
+  if (analyticsInstance) {
+    return analyticsInstance;
+  }
 
   try {
     const supported = await isSupported();
-    if (!supported) return null;
+
+    if (!supported) {
+      return null;
+    }
+
     analyticsInstance = getAnalytics(firebaseApp);
+
     return analyticsInstance;
   } catch {
+    // Analytics must never prevent the application from starting.
     return null;
   }
 }
 
+// ---------------------------------------------------------------------------
+// Firebase Emulators
+// ---------------------------------------------------------------------------
 
-
-
-
-
-
-
-
-const firebaseConfig = {
-  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
-  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
-  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
-};
-
-function getFirebaseApp(): FirebaseApp {
-  return getApps().length ? getApp() : initializeApp(firebaseConfig);
+declare global {
+  // eslint-disable-next-line no-var
+  var __ISOLYNIC_EMULATORS_CONNECTED__: boolean | undefined;
 }
 
-export const app = getFirebaseApp();
-export const db: Firestore = getFirestore(app);
-export const auth: Auth = getAuth(app);
+function connectEmulatorsIfNeeded(): void {
+  if (!isBrowser || !useEmulators) return;
 
-// Offline cache — required by spec §52 ("show last known valid state offline").
-// Guarded for SSR since IndexedDB only exists in the browser, and guarded
-// against multi-tab failures which are non-fatal.
-if (typeof window !== "undefined") {
-  enableIndexedDbPersistence(db).catch((err) => {
-    if (err.code === "failed-precondition") {
-      // Multiple tabs open — persistence can only be enabled in one at a time.
-      console.warn("Firestore persistence unavailable: multiple tabs open.");
-    } else if (err.code === "unimplemented") {
-      console.warn("Firestore persistence unavailable in this browser.");
-    }
-  });
+  if (globalThis.__ISOLYNIC_EMULATORS_CONNECTED__) {
+    return;
+  }
+
+  try {
+    connectFirestoreEmulator(
+      db,
+      EMULATOR_HOST,
+      8080
+    );
+
+    connectFunctionsEmulator(
+      functions,
+      EMULATOR_HOST,
+      5001
+    );
+
+    connectAuthEmulator(
+      auth,
+      `http://${EMULATOR_HOST}:9099`
+    );
+
+    globalThis.__ISOLYNIC_EMULATORS_CONNECTED__ = true;
+  } catch (error) {
+    // Prevent emulator connection issues from crashing the application.
+    // eslint-disable-next-line no-console
+    console.error(
+      "[Isolynic] Failed to connect Firebase emulators.",
+      error
+    );
+  }
 }
+
+connectEmulatorsIfNeeded();
