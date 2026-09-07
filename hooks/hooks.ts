@@ -1220,9 +1220,6 @@ export function useCustomerScreen(customerId: string | null): UseCustomerScreenR
 
 // hooks/useAccount.ts
 
-'use client';
-
-
 
 interface UseAccountResult {
   account: AccountState | null;
