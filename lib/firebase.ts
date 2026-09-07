@@ -21,6 +21,11 @@ import {
   connectFirestoreEmulator,
   persistentLocalCache,
   persistentMultipleTabManager,
+  collection,
+  doc,
+  addDoc,
+  updateDoc,
+  serverTimestamp,
   type Firestore,
 } from "firebase/firestore";
 
@@ -215,3 +220,205 @@ function connectEmulatorsIfNeeded(): void {
 }
 
 connectEmulatorsIfNeeded();
+
+// ---------------------------------------------------------------------------
+// Customer helpers
+// ---------------------------------------------------------------------------
+
+export async function createNote(
+  customerId: string,
+  text: string
+): Promise<string> {
+  const trimmedText = text.trim();
+
+  if (!trimmedText) {
+    throw new Error("Note cannot be empty.");
+  }
+
+  if (!auth.currentUser) {
+    throw new Error("You must be signed in to add a note.");
+  }
+
+  const notesRef = collection(
+    db,
+    "customers",
+    customerId,
+    "notes"
+  );
+
+  const noteRef = await addDoc(notesRef, {
+    text: trimmedText,
+    createdBy: "owner",
+    createdAt: serverTimestamp(),
+  });
+
+  return noteRef.id;
+}
+
+export async function confirmSmartSuggestion(
+  customerId: string,
+  suggestionId: string,
+  accept: boolean
+): Promise<void> {
+  if (!auth.currentUser) {
+    throw new Error(
+      "You must be signed in to update a suggestion."
+    );
+  }
+
+  const suggestionRef = doc(
+    db,
+    "customers",
+    customerId,
+    "smartSuggestions",
+    suggestionId
+  );
+
+  await updateDoc(suggestionRef, {
+    status: accept ? "saved" : "ignored",
+  });
+}
+
+export async function editCustomerIdentity(
+  customerId: string,
+  updates: {
+    displayName?: string;
+    phone?: string;
+    preferredChannel?: "whatsapp" | "phone" | "web";
+  }
+): Promise<void> {
+  if (!auth.currentUser) {
+    throw new Error(
+      "You must be signed in to edit customer information."
+    );
+  }
+
+  const customerRef = doc(
+    db,
+    "customers",
+    customerId
+  );
+
+  await updateDoc(customerRef, {
+    ...updates,
+    updatedAt: serverTimestamp(),
+  });
+}
+
+
+export async function recoverOpportunity(
+  opportunityId: string
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!auth.currentUser) {
+    return {
+      ok: false,
+      reason: "You must be signed in to recover an opportunity.",
+    };
+  }
+
+  try {
+    const opportunityRef = doc(
+      db,
+      "opportunities",
+      opportunityId
+    );
+
+    await updateDoc(opportunityRef, {
+      status: "RECOVERY_SENT",
+      ownerAction: "recover",
+      lastRecoveryAction: {
+        type: "follow_up",
+        at: Date.now(),
+        channel: "whatsapp",
+      },
+      updatedAt: Date.now(),
+      version: Date.now(),
+    });
+
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      reason:
+        error instanceof Error
+          ? error.message
+          : "We couldn't recover this opportunity.",
+    };
+  }
+}
+
+export async function ignoreOpportunity(
+  opportunityId: string
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!auth.currentUser) {
+    return {
+      ok: false,
+      reason: "You must be signed in to ignore an opportunity.",
+    };
+  }
+
+  try {
+    const opportunityRef = doc(
+      db,
+      "opportunities",
+      opportunityId
+    );
+
+    await updateDoc(opportunityRef, {
+      status: "IGNORED",
+      ownerAction: "ignore",
+      explicitlyRejected: true,
+      undoExpiresAt: Date.now() + 30_000,
+      updatedAt: Date.now(),
+      version: Date.now(),
+    });
+
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      reason:
+        error instanceof Error
+          ? error.message
+          : "Couldn't ignore this opportunity.",
+    };
+  }
+}
+
+export async function markNotACustomer(
+  opportunityId: string
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!auth.currentUser) {
+    return {
+      ok: false,
+      reason: "You must be signed in to update this opportunity.",
+    };
+  }
+
+  try {
+    const opportunityRef = doc(
+      db,
+      "opportunities",
+      opportunityId
+    );
+
+    await updateDoc(opportunityRef, {
+      status: "NOT_A_CUSTOMER",
+      ownerAction: "not_a_customer",
+      explicitlyRejected: true,
+      undoExpiresAt: Date.now() + 30_000,
+      updatedAt: Date.now(),
+      version: Date.now(),
+    });
+
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      reason:
+        error instanceof Error
+          ? error.message
+          : "Couldn't mark this as not a customer.",
+    };
+  }
+}

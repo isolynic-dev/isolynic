@@ -160,6 +160,32 @@ export function useAuth(): AuthState {
 
 
 
+export function useAuthedBusiness() {
+  const [uid, setUid] = useState<string | null>(null);
+  const [businessId, setBusinessId] = useState<string | null>(null);
+
+  useEffect(() => {
+    return onAuthStateChanged(auth, (user) => {
+      setUid(user?.uid ?? null);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!uid) {
+      setBusinessId(null);
+      return;
+    }
+
+    return onSnapshot(doc(db, "users", uid), (snap) => {
+      setBusinessId((snap.data()?.businessId as string) ?? null);
+    });
+  }, [uid]);
+
+  return { uid, businessId };
+}
+
+
+
 
 // src/hooks/useOnboardingState.ts
 

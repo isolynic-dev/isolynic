@@ -5,16 +5,19 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { useOpportunity } from '@/hooks/hooks';
-import { OpportunityHeader ,
-CustomerIdentity ,
-StatusBanner ,
-AttentionReason,
- OpportunitySummaryCard,
- RecommendationPanel ,
-SupportingDetails ,
-MobileActionBar ,
-DismissConfirmDialog,
-ResolveDialog } from '@/components/opportunity';
+import {
+  OpportunityHeader,
+  CustomerIdentity,
+  StatusBanner,
+  AttentionReason,
+  OpportunitySummaryCard,
+  RecommendationPanel,
+  SupportingDetails,
+  MobileActionBar,
+  DismissConfirmDialog,
+  ResolveDialog,
+  OpportunityTimeline,
+} from '@/components/opportunity';
 import { logAnalyticsEvent } from '@/lib/analytics';
 
 export default function OpportunityPage({ params }: { params: { id: string } }) {

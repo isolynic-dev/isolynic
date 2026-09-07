@@ -1,54 +1,32 @@
 "use client";
 
 
-import { useState } from "react";
 import { Play, Pause, Download, ImageOff } from "lucide-react";
 import { MessageAttachment } from "@/types/conversations";
-import { useState } from "react";
 import { ChevronDown, ChevronUp } from "lucide-react";
-import { useState } from "react";
 import { ChevronLeft, MoreVertical } from "lucide-react";
 import { Conversation, Customer } from "@/types/conversations";
-import { StatusPill } from "./StatusPill";
-import { ConversationOverflowMenu } from "./ConversationOverflowMenu";
-import { useState } from "react";
-import { Customer } from "@/types/conversations";
 import { resolveIdentityMatch } from "@/lib/conversations";
-import { useState } from "react";
-import { Conversation } from "@/types/conversations";
 import {
   markNotOpportunity,
   closeConversation,
   reopenConversation,
   deleteConversation,
 } from "@/lib/conversations";
-import { ConfirmDialog } from "./ConfirmDialog";
-import { useState } from "react";
-import { Conversation } from "@/types/conversations";
-import { takeOverConversation } from "@/lib/conversations";
 import { SystemEvent } from "@/types/conversations";
 import { formatTimelineTimestamp } from "@/lib/format";
 import { ConversationMessage } from "@/types/conversations";
-import { AttachmentView } from "./AttachmentView";
 import { retryFailedMessage } from "@/lib/conversations";
-import { useEffect, useRef } from "react";
 import { TimelineItem } from "@/types/conversations";
 import { dayKey, formatDaySeparator } from "@/lib/format";
-import { DateSeparator } from "./timeline/DateSeparator";
-import { SystemEventRow } from "./timeline/SystemEventRow";
-import { MessageBubble } from "./timeline/MessageBubble";
 import { useState, useRef, useEffect } from "react";
 import { Send, Phone, UserCheck } from "lucide-react";
-import { Conversation } from "@/types/conversations";
 import {
   sendOwnerMessage,
   requestReplySuggestion,
   takeOverConversation,
 } from "@/lib/conversations";
-import { useState } from "react";
-import { Conversation, Customer } from "@/types/conversations";
 import { addPrivateNote } from "@/lib/conversations";
-import { useEffect, useState } from "react";
 import { X } from "lucide-react";
 import { getAvailableSlots, createBooking } from "@/lib/conversations";
 
@@ -720,7 +698,7 @@ function DocumentAttachment({ attachment }: { attachment: MessageAttachment }) {
 
 
 
-type Props = {
+type ConversationTimelineProps = {
   items: TimelineItem[];
   loading: boolean;
   loadingMore: boolean;
@@ -739,7 +717,7 @@ export function ConversationTimeline({
   loadingMore,
   hasMore,
   onLoadOlder,
-}: Props) {
+}: ConversationTimelineProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -799,7 +777,7 @@ export function ConversationTimeline({
         <p className="py-2 text-center text-xs text-slate-400">Loading earlier messages…</p>
       )}
 
-      {items.map((item) => {
+ {items.map((item: TimelineItem) => {
         const ts = item.kind === "message" ? item.data.timestamp : item.data.timestamp;
         const key = dayKey(ts);
         const showSeparator = key !== lastDayKey;
@@ -851,7 +829,7 @@ function EmptyTimeline() {
 
 // components/conversation/Composer.tsx
 
-type Props = {
+type ComposerProps = {
   conversation: Conversation;
   isOnline: boolean;
   onCall: () => void;
@@ -863,7 +841,11 @@ type Props = {
  * selectors (spec §24). The one AI-assisted affordance is a single
  * optional suggested reply that never auto-sends (spec §25).
  */
-export function Composer({ conversation, isOnline, onCall }: Props) {
+export function Composer({
+  conversation,
+  isOnline,
+  onCall,
+}: ComposerProps) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [suggestion, setSuggestion] = useState<string | null>(null);
@@ -1031,7 +1013,7 @@ function ReleaseControlLink({ conversationId }: { conversationId: string }) {
       disabled={busy}
       onClick={async () => {
         setBusy(true);
-        const { releaseConversationToIsolynic } = await import("@/lib/conversation/actions");
+        const { releaseConversationToIsolynic } = await import("@/lib/conversations");
         try {
           await releaseConversationToIsolynic(conversationId);
         } finally {

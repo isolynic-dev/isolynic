@@ -4,11 +4,7 @@
 
 import { createContext, useEffect, useCallback, useContext,useTransition, useRef, useState, type ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
-import type { OpportunityDoc } from '@/types/opportunity';
-import { statusToHumanLabel } from '@/types/recovery';
 import { recoverOpportunity, ignoreOpportunity, markNotACustomer } from '@/lib/firebase';
-import { useToast } from './Toast';
-import { ConfirmDialog } from './ConfirmDialog';
 import type { OpportunityDoc } from '@/types/recovery';
 import type { QueueFilter } from '@/hooks/hooks';
 

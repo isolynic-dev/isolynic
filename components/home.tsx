@@ -861,8 +861,7 @@ export function BottomNav() {
 // src/components/home/SideNav.tsx
 
 
-
-const ITEMS = [
+const SIDE_NAV_ITEMS = [
   { href: "/home", label: "Home", icon: HomeIcon },
   { href: "/recover", label: "Recover", icon: LifeBuoy },
   { href: "/customers", label: "Customers", icon: Users },
@@ -878,7 +877,7 @@ export function SideNav() {
       aria-label="Primary"
       className="fixed left-0 top-16 hidden h-[calc(100vh-4rem)] w-56 flex-col gap-1 border-r border-neutral-200 bg-white px-3 py-4 md:flex dark:border-neutral-800 dark:bg-neutral-950"
     >
-      {ITEMS.map(({ href, label, icon: Icon }) => {
+      {SIDE_NAV_ITEMS.map(({ href, label, icon: Icon }) => {
         const active = pathname === href;
         return (
           <Link

@@ -90,22 +90,3 @@ export default function RecoveryQueuePage() {
     </ToastProvider>
   );
 }
-
-// hooks/useAuthedBusiness.ts
-
-
-export function useAuthedBusiness() {
-  const [uid, setUid] = useState<string | null>(null);
-  const [businessId, setBusinessId] = useState<string | null>(null);
-
-  useEffect(() => onAuthStateChanged(auth, (user) => setUid(user?.uid ?? null)), []);
-
-  useEffect(() => {
-    if (!uid) return;
-    return onSnapshot(doc(db, 'users', uid), (snap) => {
-      setBusinessId((snap.data()?.businessId as string) ?? null);
-    });
-  }, [uid]);
-
-  return { uid, businessId };
-}

@@ -3,7 +3,7 @@
 
 import { useEffect, useState } from "react";
 import { getAuth, onAuthStateChanged } from "firebase/auth";
-import { app } from "@/lib/firebase";
+import { firebaseApp } from "@/lib/firebase";
 import { useHomeSummary } from "@/hooks/hooks";
 import { track } from "@/lib/analytics";
 
@@ -28,7 +28,7 @@ export default function HomePage() {
   const [authResolved, setAuthResolved] = useState(false);
 
   useEffect(() => {
-    const auth = getAuth(app);
+    const auth = getAuth(firebaseApp);
     const unsub = onAuthStateChanged(auth, (user) => {
       setOwnerId(user?.uid ?? null);
       setAuthResolved(true);

@@ -12,13 +12,17 @@ import { dayLabel, timeOfDay } from '@/lib/format';
 
 
 
-interface Props {
+interface OpportunityHeaderProps {
   opportunity: Opportunity;
   onOverflowAction: (action: 'not_opportunity' | 'won' | 'lost' | 'call' | 'note') => void;
   breadcrumbLabel?: string;
 }
 
-export function OpportunityHeader({ opportunity, onOverflowAction, breadcrumbLabel }: Props) {
+export function OpportunityHeader({
+  opportunity,
+  onOverflowAction,
+  breadcrumbLabel,
+}: OpportunityHeaderProps) {
   const router = useRouter();
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -356,11 +360,6 @@ function SummaryItem({ label, value }: { label: string; value: string }) {
 
 
 
-interface Props {
-  events: TimelineEvent[];
-  earlierCount: number; // events not loaded/shown, summarized
-  onViewFullConversation: () => void;
-}
 
 const EVENT_ICON: Record<string, string> = {
   call: '📞',
@@ -373,8 +372,19 @@ const EVENT_ICON: Record<string, string> = {
   status_change: '•',
 };
 
-export function OpportunityTimeline({ events, earlierCount, onViewFullConversation }: Props) {
-  const [expanded, setExpanded] = useState(false);
+interface OpportunityTimelineProps {
+  events: TimelineEvent[];
+  earlierCount: number; // events not loaded/shown, summarized
+  onViewFullConversation: () => void;
+}
+
+export function OpportunityTimeline({
+  events,
+  earlierCount,
+  onViewFullConversation,
+}: OpportunityTimelineProps) {
+
+ const [expanded, setExpanded] = useState(false);
 
   const visibleEvents = expanded ? events : events.slice(-6);
   const groups = groupByDay(visibleEvents);
@@ -442,17 +452,24 @@ function groupByDay(events: TimelineEvent[]) {
 
 // components/opportunity/RecommendationPanel.tsx
 
-interface Props {
+
+type LocalState = 'idle' | 'sending' | 'sent' | 'error';
+
+
+interface RecommendationPanelProps {
   opportunity: Opportunity;
   onRecover: (message?: string) => Promise<RecoverResponse>;
   onTakeover: () => Promise<void>;
   sticky?: boolean;
 }
 
-type LocalState = 'idle' | 'sending' | 'sent' | 'error';
-
-export function RecommendationPanel({ opportunity, onRecover, onTakeover, sticky }: Props) {
-  const [editing, setEditing] = useState(false);
+export function RecommendationPanel({
+  opportunity,
+  onRecover,
+  onTakeover,
+  sticky,
+}: RecommendationPanelProps) {
+const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(opportunity.recommendedAction.suggestedMessage ?? '');
   const [state, setState] = useState<LocalState>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -668,15 +685,20 @@ function SecondaryButton({
 // components/opportunity/SupportingDetails.tsx
 
 
-interface Props {
+interface SupportingDetailsProps {
   opportunity: Opportunity;
   onAddNote: (note: string) => Promise<void>;
   onCall: () => void;
   onMessage: () => void;
 }
 
-export function SupportingDetails({ opportunity, onAddNote, onCall, onMessage }: Props) {
-  return (
+export function SupportingDetails({
+  opportunity,
+  onAddNote,
+  onCall,
+  onMessage,
+}: SupportingDetailsProps) {
+return (
     <section className="space-y-6">
       <div className="flex gap-2">
         {opportunity.customer.phone && (
@@ -833,15 +855,20 @@ function OwnerNote({
 // components/opportunity/MobileActionBar.tsx
 
 
-interface Props {
+interface MobileActionBarProps {
   onRecover: () => void;
   onHandleMyself: () => void;
   onMore: (action: 'not_opportunity' | 'won' | 'lost' | 'call' | 'note') => void;
   recoverDisabled?: boolean;
 }
 
-export function MobileActionBar({ onRecover, onHandleMyself, onMore, recoverDisabled }: Props) {
-  const [moreOpen, setMoreOpen] = useState(false);
+export function MobileActionBar({
+  onRecover,
+  onHandleMyself,
+  onMore,
+  recoverDisabled,
+}: MobileActionBarProps) {
+const [moreOpen, setMoreOpen] = useState(false);
 
   return (
     <>

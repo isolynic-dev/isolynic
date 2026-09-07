@@ -3,8 +3,8 @@
 "use client";
 
 import { useMemo } from "react";
-import { Avatar } from "./Avatar";
-import type { CustomerDoc, OpportunityDoc } from "@/types/customer";
+import type { CustomerDoc } from "@/types/customer";
+import type { OpportunityDoc } from "@/types/recovery";
 import type { ConversationDoc, MessagePreviewDoc } from "@/types/customer";
 import type { TimelineEventDoc } from "@/types/customer";
 import type { AppointmentDoc } from "@/types/customer";
@@ -403,9 +403,9 @@ export function CurrentSituationCard({
     return (
       <div className={`rounded-xl border p-4 ${toneStyles.attention}`} role="status" aria-live="polite">
         <p className="font-medium">May be slipping away</p>
-        {primaryOpportunity?.whyFlagged && (
-          <p className="text-sm mt-1">{primaryOpportunity.whyFlagged}</p>
-        )}
+     {primaryOpportunity?.whyNow && (
+  <p className="text-sm mt-1">{primaryOpportunity.whyNow}</p>
+)}  
         <div className="mt-3 flex gap-3">
           <button type="button" onClick={onRecoverNow} className={`${buttonClass} bg-amber-600 text-white hover:bg-amber-700`}>
             Recover now
@@ -419,25 +419,27 @@ export function CurrentSituationCard({
   }
 
   if (state === "waiting") {
-    if (primaryOpportunity?.recoveryState === "in_progress") {
-      const lastMsg = primaryOpportunity.recoveryLastMessageAt
-        ? formatRelative(primaryOpportunity.recoveryLastMessageAt.toMillis())
-        : null;
-      return (
-        <div className={`rounded-xl border p-4 ${toneStyles.attention}`} role="status">
-          <p className="font-medium">We're trying to bring this customer back.</p>
-          {lastMsg && <p className="text-sm mt-1">Last message sent {lastMsg}.</p>}
-          <div className="mt-3 flex gap-3">
-            <button type="button" onClick={onViewConversation} className={`${buttonClass} bg-white text-amber-900 border border-amber-300 hover:bg-amber-100`}>
-              View conversation
-            </button>
-            <button type="button" onClick={onStopRecovery} className={`${buttonClass} bg-neutral-100 text-neutral-800 hover:bg-neutral-200`}>
-              Stop recovery
-            </button>
-          </div>
-        </div>
-      );
-    }
+   if (
+  primaryOpportunity &&
+  ["OWNER_APPROVED", "RECOVERY_SENT", "WAITING"].includes(primaryOpportunity.status)
+) {
+  const lastActivity = formatRelative(primaryOpportunity.latestActivityAt);
+
+  return (
+    <div className={`rounded-xl border p-4 ${toneStyles.attention}`} role="status">
+      <p className="font-medium">We're trying to bring this customer back.</p>
+      <p className="text-sm mt-1">Last activity {lastActivity}.</p>
+      <div className="mt-3 flex gap-3">
+        <button type="button" onClick={onViewConversation} className={`${buttonClass} bg-white text-amber-900 border border-amber-300 hover:bg-amber-100`}>
+          View conversation
+        </button>
+        <button type="button" onClick={onStopRecovery} className={`${buttonClass} bg-neutral-100 text-neutral-800 hover:bg-neutral-200`}>
+          Stop recovery
+        </button>
+      </div>
+    </div>
+  );
+}
     return (
       <div className={`rounded-xl border p-4 ${toneStyles.neutral}`} role="status">
         <p className="font-medium">You're waiting for the customer.</p>
@@ -495,32 +497,57 @@ function formatDate(ms: number): string {
   return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-function stateLabel(state: OpportunityDoc["state"]): string {
-  switch (state) {
-    case "new":
-      return "New";
-    case "waiting_for_customer":
-      return "Waiting for customer";
-    case "waiting_for_owner":
-      return "Waiting for you";
-    case "recovering":
-      return "Recovery in progress";
-    case "booked":
+function stateLabel(status: OpportunityDoc["status"]): string {
+  switch (status) {
+    case "NEW_RISK":
+      return "New risk";
+
+    case "RECOVERY_RECOMMENDED":
+      return "Recovery recommended";
+
+    case "OWNER_APPROVED":
+      return "Recovery approved";
+
+    case "RECOVERY_SENT":
+      return "Recovery sent";
+
+    case "WAITING":
+      return "Waiting";
+
+    case "CUSTOMER_RESPONDED":
+      return "Customer replied";
+
+    case "PROGRESSING":
+      return "Progressing";
+
+    case "BOOKED":
       return "Booked";
-    case "completed":
-      return "Completed";
-    case "lost":
+
+    case "WON":
+      return "Won";
+
+    case "LOST":
       return "Lost";
+
+    case "HANDLED":
+      return "Handled";
+
+    case "IGNORED":
+      return "Ignored";
+
+    case "NOT_A_CUSTOMER":
+      return "Not a customer";
+
+    default:
+      return "Unknown";
   }
 }
 
 function formatValue(opp: OpportunityDoc): string {
-  if (opp.bookedValue !== null) {
-    return `${opp.currency} ${opp.bookedValue.toLocaleString()}`;
+  if (opp.valueEstimate !== null && opp.valueEstimate !== undefined) {
+    return `Estimated opportunity: ${opp.valueEstimate.toLocaleString()}`;
   }
-  if (opp.estimatedValueMin !== null && opp.estimatedValueMax !== null) {
-    return `Estimated opportunity: ${opp.currency} ${opp.estimatedValueMin.toLocaleString()}–${opp.estimatedValueMax.toLocaleString()}`;
-  }
+
   return "Value not recorded";
 }
 
@@ -542,12 +569,12 @@ export function OpportunitySummary({ opportunities, onView }: OpportunitySummary
       <ul className="mt-2 space-y-3">
         {opportunities.map((opp) => (
           <li key={opp.id}>
-            <p className="font-medium text-neutral-900">{opp.title}</p>
-            <p className="text-sm text-neutral-600">{stateLabel(opp.state)}</p>
-            <p className="text-xs text-neutral-500 mt-1">
-              Started {formatDate(opp.startedAt.toMillis())} · Last activity{" "}
-              {formatDate(opp.lastActivityAt.toMillis())}
-            </p>
+            <p className="font-medium text-neutral-900">{opp.intentSummary}</p>
+            <p className="text-sm text-neutral-600">{stateLabel(opp.status)}</p>
+           <p className="text-xs text-neutral-500 mt-1">
+  Started {formatDate(opp.firstContactAt)} · Last activity{" "}
+  {formatDate(opp.latestActivityAt)}
+</p>
             <p className="text-xs text-neutral-500">{formatValue(opp)}</p>
             <button
               type="button"
