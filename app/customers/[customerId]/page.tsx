@@ -1,8 +1,8 @@
 
-// app/customers/[customerId]/page.tsx
+
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { Suspense, useCallback, useMemo, useState } from "react";
 import { useRouter, useParams, useSearchParams } from "next/navigation";
 import { useCustomerScreen } from "@/hooks/hooks";
 import { CustomerIdentity } from "@/components/customer";
@@ -26,6 +26,12 @@ import {
   setAutoRecoveryBlocked,
 } from "@/lib/customer";
 
+
+
+
+
+
+
 type PendingConfirm =
   | { kind: "delete" }
   | { kind: "mark_not_customer" }
@@ -35,7 +41,7 @@ type PendingConfirm =
 /** Screen 6 — Customer. Responsive: single column on mobile (spec §46),
  * hybrid two-column on tablet (§47), sticky left identity panel + scrolling
  * right "memory" column on desktop (§48–49). */
-export default function CustomerScreenPage() {
+function CustomerScreenPageInner() {
   const router = useRouter();
   const params = useParams<{ customerId: string }>();
   const searchParams = useSearchParams();
@@ -353,5 +359,14 @@ export default function CustomerScreenPage() {
         />
       )}
     </div>
+  );
+}
+
+
+export default function CustomerScreenPage() {
+  return (
+    <Suspense fallback={<IdentitySkeleton />}>
+      <CustomerScreenPageInner />
+    </Suspense>
   );
 }
