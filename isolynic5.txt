@@ -534,7 +534,7 @@ export async function createBooking(
 }
 
 export async function getAvailableSlots(conversationId: string, dateIso: string) {
-  const fn = httpsCallable<
+  const fn = httpsCallable
     { conversationId: string; dateIso: string },
     { slots: { startIso: string; endIso: string }[] }
   >(functions, "getAvailableSlots");
@@ -1367,7 +1367,7 @@ function AudioAttachment({ attachment }: { attachment: MessageAttachment }) {
 
 function DocumentAttachment({ attachment }: { attachment: MessageAttachment }) {
   return (
-    <a
+    
       href={attachment.url}
       target="_blank"
       rel="noreferrer"
@@ -3341,4 +3341,195 @@ export async function evaluateOpportunityStatus(
   };
 }
 
-function requiresOwnerJudgment(body: 
+function requiresOwnerJudgment(body: string): boolean {
+  const patterns = [/discount/i, /special price/i, /complain/i, /refund/i, /free of charge/i];
+  return patterns.some((p) => p.test(body));
+}
+
+function unchanged(status: OpportunityStatus): EvaluationResult {
+  return {
+    statusChanged: false,
+    status,
+    whyHere: null,
+    recommendedAction: null,
+    timelineLabel: "",
+    shouldNotifyOwner: false,
+    notificationTitle: "",
+    notificationBody: "",
+  };
+}
+```
+
+---
+
+## 35. `functions/src/conversation/notifications.ts`
+
+```typescript
+// functions/src/conversation/notifications.ts
+
+import { getFirestore } from "firebase-admin/firestore";
+import { getMessaging } from "firebase-admin/messaging";
+
+const db = getFirestore();
+
+/**
+ * Notifications tied to meaningful state only (spec §54, §78): deep-links
+ * directly into this conversation so notification → conversation → action
+ * is a single hop.
+ */
+export async function sendOwnerNotification(params: {
+  businessId: string;
+  conversationId: string;
+  title: string;
+  body: string;
+}) {
+  if (!params.title) return;
+
+  const ownersSnap = await db
+    .collection("businessMembers")
+    .where("businessId", "==", params.businessId)
+    .where("notificationsEnabled", "==", true)
+    .get();
+
+  const tokens = ownersSnap.docs
+    .map((d) => d.data().fcmToken)
+    .filter((t): t is string => !!t);
+
+  if (tokens.length === 0) return;
+
+  await getMessaging().sendEachForMulticast({
+    tokens,
+    notification: { title: params.title, body: params.body },
+    data: {
+      deepLink: `/conversations/${params.conversationId}`,
+    },
+  });
+}
+```
+
+---
+
+## 36. `functions/src/conversation/inboundWebhook.ts`
+
+```typescript
+// functions/src/conversation/inboundWebhook.ts
+
+import { onRequest } from "firebase-functions/v2/https";
+import { getFirestore, Timestamp } from "firebase-admin/firestore";
+import { defineSecret } from "firebase-functions/params";
+import * as crypto from "crypto";
+
+const db = getFirestore();
+const whatsappWebhookSecret = defineSecret("WHATSAPP_WEBHOOK_SECRET");
+
+/**
+ * Normalizes inbound provider events (spec §106–108) into the internal
+ * timeline shape. Kept isolated so the rest of the system only ever sees
+ * normalized events, not provider payloads.
+ */
+export const inboundWhatsAppWebhook = onRequest(
+  { secrets: [whatsappWebhookSecret] },
+  async (req, res) => {
+    const signature = req.get("X-Hub-Signature-256") ?? "";
+    const expected =
+      "sha256=" +
+      crypto
+        .createHmac("sha256", whatsappWebhookSecret.value())
+        .update(req.rawBody)
+        .digest("hex");
+
+    if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+      res.status(401).send("Invalid signature");
+      return;
+    }
+
+    const entry = req.body?.entry?.[0]?.changes?.[0]?.value;
+    const message = entry?.messages?.[0];
+    if (!message) {
+      res.status(200).send("OK"); // status/webhook verification pings, etc.
+      return;
+    }
+
+    const fromPhone: string = message.from;
+    const body: string = message.text?.body ?? "";
+
+    const customerSnap = await db
+      .collection("customers")
+      .where("phone", "==", fromPhone)
+      .limit(1)
+      .get();
+
+    if (customerSnap.empty) {
+      // New-customer intake belongs to a separate onboarding trigger
+      // (Screens 1–4); this webhook only appends to existing conversations.
+      res.status(200).send("OK");
+      return;
+    }
+
+    const customerId = customerSnap.docs[0].id;
+    const convoSnap = await db
+      .collection("conversations")
+      .where("customerId", "==", customerId)
+      .where("isClosed", "==", false)
+      .limit(1)
+      .get();
+
+    if (convoSnap.empty) {
+      res.status(200).send("OK");
+      return;
+    }
+
+    const convoRef = convoSnap.docs[0].ref;
+    await convoRef.collection("timeline").add({
+      _collectionType: "message",
+      conversationId: convoRef.id,
+      senderType: "CUSTOMER",
+      channel: "whatsapp",
+      body,
+      attachments: [],
+      timestamp: Timestamp.now(),
+      providerReference: message.id,
+    });
+
+    res.status(200).send("OK");
+  }
+);
+```
+
+---
+
+## 37. `functions/src/index.ts`
+
+```typescript
+// functions/src/index.ts
+
+export {
+  sendOwnerMessage,
+  retryFailedMessage,
+  takeOverConversation,
+  releaseConversationToIsolynic,
+  suggestReply,
+  markNotOpportunity,
+  closeConversation,
+  reopenConversation,
+  deleteConversationRequest,
+  addPrivateNote,
+  resolveIdentityMatch,
+  getAvailableSlots,
+  createBooking,
+} from "./conversation/callables";
+
+export { onTimelineItemCreated } from "./conversation/triggers";
+export { inboundWhatsAppWebhook } from "./conversation/inboundWebhook";
+```
+
+---
+
+A few implementation notes:
+
+- **`onTimelineItemCreated`** is the single trigger that drives status transitions, summary regeneration, and notifications — this keeps the client fully "dumb" about state logic, matching spec §105/§107.
+- **`opportunityEngine.ts`** is deliberately rule-based rather than an opaque score, so `whyHere` text is always traceable to the exact trigger — no confidence-meter risk (spec §83).
+- Provider integrations (WhatsApp/SMS send, Google Calendar OAuth) are wired with real endpoints/shapes but marked `TODO` where actual API credentials/business-specific config would be needed — that's the natural boundary of what can be finished without your provider accounts.
+- `firestore.rules` locks all conversation/customer writes to Cloud Functions only, enforcing the spec's server-side authorization requirement.
+
+Want me to also generate Cloud Scheduler jobs for the "customer went quiet for 3 days" staleness check (needed since `onTimelineItemCreated` only fires on new activity, not on elapsed time with no activity)?
