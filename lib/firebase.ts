@@ -46,10 +46,6 @@ import {
   type Analytics,
 } from "firebase/analytics";
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
 const FUNCTIONS_REGION = "us-central1";
 const EMULATOR_HOST = "localhost";
 
@@ -63,70 +59,26 @@ const firebaseConfig: FirebaseOptions = {
   measurementId: process.env.NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID,
 };
 
-const isBrowser = typeof window !== "undefined";
-const useEmulators =
-  process.env.NEXT_PUBLIC_USE_FIREBASE_EMULATORS === "true";
 
-// ---------------------------------------------------------------------------
-// Environment validation
-// ---------------------------------------------------------------------------
-
-function validateEnv(): void {
-  if (!isBrowser) return;
-
-  const missing = Object.entries(firebaseConfig)
-    .filter(([key, value]) => key !== "measurementId" && !value)
-    .map(([key]) => key);
-
-  if (missing.length === 0) return;
-
-  // eslint-disable-next-line no-console
-  console.error(
-    `[Isolynic] Missing Firebase environment variables: ${missing.join(", ")}`
-  );
-}
-
-validateEnv();
-
-// ---------------------------------------------------------------------------
-// Firebase App
-// ---------------------------------------------------------------------------
 
 export const firebaseApp: FirebaseApp =
   getApps().length > 0
     ? getApp()
     : initializeApp(firebaseConfig);
 
-// ---------------------------------------------------------------------------
-// Authentication
-// ---------------------------------------------------------------------------
-
 export const auth: Auth = getAuth(firebaseApp);
 
 export const googleProvider = new GoogleAuthProvider();
-
-// ---------------------------------------------------------------------------
-// Cloud Functions
-// ---------------------------------------------------------------------------
 
 export const functions: Functions = getFunctions(
   firebaseApp,
   FUNCTIONS_REGION
 );
 
-// ---------------------------------------------------------------------------
-// Storage
-// ---------------------------------------------------------------------------
-
 export const storage: FirebaseStorage = getStorage(firebaseApp);
 
-// ---------------------------------------------------------------------------
-// Firestore
-// ---------------------------------------------------------------------------
-
 function createFirestore(): Firestore {
-  // SSR / non-browser environments cannot use IndexedDB persistence.
-  if (!isBrowser) {
+  if (typeof window === "undefined") {
     return getFirestore(firebaseApp);
   }
 
@@ -137,13 +89,46 @@ function createFirestore(): Firestore {
       }),
     });
   } catch {
-    // Firestore has already been initialized elsewhere, such as
-    // during Next.js hot reload or another module import.
     return getFirestore(firebaseApp);
   }
 }
 
 export const db: Firestore = createFirestore();
+
+const isBrowser = typeof window !== "undefined";
+const useEmulators =
+  process.env.NEXT_PUBLIC_USE_FIREBASE_EMULATORS === "true";
+
+// ---------------------------------------------------------------------------
+// Environment validation
+// ---------------------------------------------------------------------------
+
+function validateFirebaseConfig(): void {
+  const required = [
+    ["NEXT_PUBLIC_FIREBASE_API_KEY", firebaseConfig.apiKey],
+    ["NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN", firebaseConfig.authDomain],
+    ["NEXT_PUBLIC_FIREBASE_PROJECT_ID", firebaseConfig.projectId],
+    ["NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET", firebaseConfig.storageBucket],
+    [
+      "NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID",
+      firebaseConfig.messagingSenderId,
+    ],
+    ["NEXT_PUBLIC_FIREBASE_APP_ID", firebaseConfig.appId],
+  ] as const;
+
+  const missing = required
+    .filter(([, value]) => !value)
+    .map(([name]) => name);
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing Firebase environment variables: ${missing.join(", ")}`
+    );
+  }
+}
+
+validateFirebaseConfig();
+
 
 // ---------------------------------------------------------------------------
 // Firebase Analytics
