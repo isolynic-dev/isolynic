@@ -38,7 +38,11 @@ export type WelcomeEvent =
   | "onboarding_abandoned"
   | "onboarding_completed"
   | "first_test_started"
-  | "first_test_completed";
+  | "first_test_completed"
+   | "instant_check_started"
+  | "instant_check_completed"
+  | "instant_check_protect_clicked"
+  ;
 
 // ---------------------------------------------------------------------------
 // Home analytics events
